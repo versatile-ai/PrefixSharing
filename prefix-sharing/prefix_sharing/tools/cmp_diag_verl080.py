@@ -7,7 +7,8 @@
 
   **packed（suffix 对齐）**
     - attention_output per-layer cos   每层 attention 输出余弦相似度
-    - first_token                       packed[0]（attn[0] + logits[0]）
+    - provider_first_token              packed[0] 的 provider 哨兵检查
+    - reuser_first_suffix_token         每个 reuser 的首个 suffix token（restore 边界）
     - logits packed                     全 packed logits suffix 对齐对比
 
   **2D（v080 特有，restore 后 ``[B, L_max]``）**
@@ -222,6 +223,31 @@ def _get_num_layers(dir_path: str) -> int:
     return max(d.keys()) if isinstance(d, dict) and d else 0
 
 
+def cmp_input_ids(dir_on: str, dir_off: str, tag: str) -> CheckResult:
+    """Verify that ON/OFF consumed exactly the same original token batch."""
+    on_ids = _load_tensor(dir_on, f"input_ids_{tag}.pt")
+    off_ids = _load_tensor(dir_off, f"input_ids_{tag}.pt")
+    if on_ids is None or off_ids is None:
+        return CheckResult(
+            name="input_ids",
+            passed=False,
+            metrics={"error": f"input_ids_{tag}.pt missing in ON or OFF dump"},
+        )
+    if on_ids.shape != off_ids.shape:
+        return CheckResult(
+            name="input_ids",
+            passed=False,
+            metrics={"error": "shape mismatch", "s_on": tuple(on_ids.shape),
+                     "s_off": tuple(off_ids.shape)},
+        )
+    different = int((on_ids != off_ids).sum())
+    return CheckResult(
+        name="input_ids",
+        passed=different == 0,
+        metrics={"shape": tuple(on_ids.shape), "different_tokens": different},
+    )
+
+
 # ════════════════════════════════════════════════════════════════
 #  Packed suffix alignment
 # ════════════════════════════════════════════════════════════════
@@ -345,16 +371,102 @@ def cmp_attn_layer(dir_on: str, dir_off: str,
     if not isinstance(da, dict) or not isinstance(db, dict):
         return None
 
+    on_layers, off_layers = set(da.keys()), set(db.keys())
+    if on_layers != off_layers:
+        return CheckResult(name="attn_per_layer", passed=False,
+                           metrics={"error": "layer set mismatch",
+                                    "on_layers": sorted(on_layers),
+                                    "off_layers": sorted(off_layers)})
+
     results = {}
-    for lyr in sorted(set(da.keys()) & set(db.keys())):
+    for lyr in sorted(on_layers):
         a, b = da[lyr], db[lyr]
         need = align_mask is not None and a.shape[0] != b.shape[0]
         try:
             results[lyr] = _cos_for_layer(a, b, align_mask if need else None)
         except ValueError as e:
             results[lyr] = {"error": str(e)}
-    return CheckResult(name="attn_per_layer", passed=True,
+    passed = bool(results) and all(
+        "error" not in metrics
+        and metrics["cos_avg"] > _COS_AVG_PASS
+        and metrics["cos_min"] > _COS_MIN_PASS
+        for metrics in results.values()
+    )
+    return CheckResult(name="attn_per_layer", passed=passed,
                        metrics={"layers": results})
+
+
+def _token_major(tensor: torch.Tensor) -> torch.Tensor:
+    """Normalize HF [B,H,L,D] or packed [T,H,D] tensors to [T,H,D]."""
+    if tensor.dim() == 4:
+        return tensor.transpose(1, 2).reshape(-1, tensor.shape[1], tensor.shape[-1])
+    return tensor
+
+
+def _load_tensor_dict(dir_path: str, filename: str) -> dict | None:
+    fp = os.path.join(dir_path, filename)
+    if not os.path.exists(fp):
+        return None
+    result = torch.load(fp, weights_only=True)
+    return result if isinstance(result, dict) else None
+
+
+def cmp_attention_inputs(dir_on: str, dir_off: str) -> CheckResult | None:
+    """Compare post-RoPE Q/K/V inputs and report the first diverging layer."""
+    on_dict = _load_tensor_dict(dir_on, "attn_inputs.pt")
+    off_dict = _load_tensor_dict(dir_off, "attn_inputs.pt")
+    if on_dict is None or off_dict is None:
+        return None
+    if set(on_dict) != set(off_dict):
+        return CheckResult(name="attn_inputs", passed=False,
+                           metrics={"error": "layer set mismatch"})
+    align_mask = _build_attn_align_mask(dir_on, dir_off)
+    layers: dict[int, dict] = {}
+    for layer in sorted(on_dict):
+        layer_metrics = {}
+        for name in ("query", "key", "value"):
+            on_tensor = _token_major(on_dict[layer][name])
+            off_tensor = _token_major(off_dict[layer][name])
+            try:
+                metrics = _cos_for_layer(on_tensor, off_tensor, align_mask)
+            except ValueError as error:
+                return CheckResult(name="attn_inputs", passed=False,
+                                   metrics={"error": f"L{layer} {name}: {error}"})
+            layer_metrics[name] = metrics
+        layers[layer] = layer_metrics
+    passed = all(
+        metric["cos_avg"] > _COS_AVG_PASS and metric["cos_min"] > _COS_MIN_PASS
+        for values in layers.values() for metric in values.values()
+    )
+    return CheckResult(name="attn_inputs", passed=passed, metrics={"layers": layers})
+
+
+def cmp_expanded_kv(dir_on: str, dir_off: str) -> CheckResult | None:
+    """Compare ON store/load-expanded KV with OFF's full baseline KV."""
+    expanded = _load_tensor_dict(dir_on, "expanded_kv.pt")
+    baseline = _load_tensor_dict(dir_off, "attn_inputs.pt")
+    if expanded is None or baseline is None:
+        return None
+    if set(expanded) != set(baseline):
+        return CheckResult(name="expanded_kv", passed=False,
+                           metrics={"error": "layer set mismatch"})
+    layers: dict[int, dict] = {}
+    for layer in sorted(expanded):
+        layer_metrics = {}
+        for name in ("key", "value"):
+            on_tensor = _token_major(expanded[layer][name])
+            off_tensor = _token_major(baseline[layer][name])
+            try:
+                layer_metrics[name] = _cos_for_layer(on_tensor, off_tensor)
+            except ValueError as error:
+                return CheckResult(name="expanded_kv", passed=False,
+                                   metrics={"error": f"L{layer} {name}: {error}"})
+        layers[layer] = layer_metrics
+    passed = all(
+        metric["cos_avg"] > _COS_AVG_PASS and metric["cos_min"] > _COS_MIN_PASS
+        for values in layers.values() for metric in values.values()
+    )
+    return CheckResult(name="expanded_kv", passed=passed, metrics={"layers": layers})
 
 
 def cmp_first_token(dir_on: str, dir_off: str) -> list[CheckResult]:
@@ -372,17 +484,79 @@ def cmp_first_token(dir_on: str, dir_off: str) -> list[CheckResult]:
         if a is not None and b is not None:
             a0 = a.squeeze(1) if a.dim() == 3 else a
             b0 = b.squeeze(1) if b.dim() == 3 else b
+            metrics = _first_token_metrics(a0[0], b0[0])
             results.append(CheckResult(
-                name="first_token_attn",
-                metrics=_first_token_metrics(a0[0], b0[0])))
+                name="provider_first_token_attn",
+                passed=metrics["cos"] > _COS_AVG_PASS,
+                metrics=metrics))
 
     lo = _load_logits(dir_on)
     lf = _load_logits(dir_off)
     if lo is not None and lf is not None:
         lo_first, lf_first = _logits_first_token(lo, lf)
+        metrics = _first_token_metrics(lo_first, lf_first)
         results.append(CheckResult(
-            name="first_token_logits",
-            metrics=_first_token_metrics(lo_first, lf_first)))
+            name="provider_first_token_logits",
+            passed=metrics["cos"] > _COS_AVG_PASS,
+            metrics=metrics))
+    return results
+
+
+def _reuser_first_suffix_positions(
+    on_meta: dict, off_meta: dict,
+) -> list[tuple[int, int, int]]:
+    """Return ``(row, on_index, off_index)`` at every reuser restore boundary."""
+    on_cu, off_cu = on_meta["cu_seqlens"], off_meta["cu_seqlens"]
+    prefix_lens = on_meta["prefix_lens"]
+    if on_cu.numel() != off_cu.numel() or prefix_lens.numel() != on_cu.numel() - 1:
+        raise ValueError("incompatible ON/OFF packed metadata")
+    positions = []
+    for row, prefix_len in enumerate(prefix_lens.tolist()):
+        if prefix_len > 0:
+            positions.append((row, int(on_cu[row]), int(off_cu[row]) + int(prefix_len)))
+    return positions
+
+
+def cmp_reuser_first_suffix_token(dir_on: str, dir_off: str) -> list[CheckResult]:
+    """Compare every reuser's first suffix token, including the restore boundary."""
+    on_meta = _load_packed_meta(dir_on, "cu_seqlens_q_logits.pt")
+    off_meta = _load_packed_meta(dir_off, "cu_seqlens_q_logits.pt")
+    if on_meta is None or off_meta is None:
+        return [CheckResult(name="reuser_first_suffix", passed=False,
+                            metrics={"error": "packed metadata missing"})]
+    try:
+        positions = _reuser_first_suffix_positions(on_meta, off_meta)
+    except ValueError as error:
+        return [CheckResult(name="reuser_first_suffix", passed=False,
+                            metrics={"error": str(error)})]
+    if not positions:
+        return []
+
+    results: list[CheckResult] = []
+    last = _get_num_layers(dir_on) or _get_num_layers(dir_off)
+    if last:
+        on_attn, off_attn = _load_attn_output(dir_on, last), _load_attn_output(dir_off, last)
+        if on_attn is not None and off_attn is not None:
+            on_attn = on_attn.squeeze(1) if on_attn.dim() == 3 else on_attn
+            off_attn = off_attn.squeeze(1) if off_attn.dim() == 3 else off_attn
+            for row, on_index, off_index in positions:
+                metrics = _first_token_metrics(on_attn[on_index], off_attn[off_index])
+                metrics.update({"row": row, "on_packed_index": on_index,
+                                "off_packed_index": off_index})
+                results.append(CheckResult(
+                    name=f"reuser_first_suffix_attn_row{row}",
+                    passed=metrics["cos"] > _COS_AVG_PASS, metrics=metrics))
+
+    on_logits, off_logits = _load_logits(dir_on), _load_logits(dir_off)
+    if on_logits is not None and off_logits is not None:
+        on_logits, off_logits = _logits_ensure_token_major(on_logits, off_logits)
+        for row, on_index, off_index in positions:
+            metrics = _first_token_metrics(on_logits[on_index], off_logits[off_index])
+            metrics.update({"row": row, "on_packed_index": on_index,
+                            "off_packed_index": off_index})
+            results.append(CheckResult(
+                name=f"reuser_first_suffix_logits_row{row}",
+                passed=metrics["cos"] > _COS_AVG_PASS, metrics=metrics))
     return results
 
 
@@ -737,7 +911,7 @@ def _print_per_layer(r: CheckResult):
 
 
 def _print_first_token(r: CheckResult):
-    print(_SEP_SINGLE + f"\n  [first_token]  {r.name}  (packed position [0])")
+    print(_SEP_SINGLE + f"\n  [token_sentinel]  {r.name}")
     print(_SEP_SINGLE)
     m = r.metrics
     for k in ["mean_abs", "max_abs", "rel_max", "rel_mean", "cos", "pearson"]:
@@ -907,11 +1081,22 @@ def main():
 
     all_results: list[CheckResult] = []
 
+    # The replay fixture must make ON/OFF consume the identical original batch.
+    # Packed lengths intentionally differ, but input IDs must not.
+    r = cmp_input_ids(args.dir_on, args.dir_off, args.tag)
+    all_results.append(r)
+
     # ── packed: rope 角度（suffix 对齐，应精确相等 max_diff==0） ──
     r = cmp_rope_freqs(args.dir_on, args.dir_off)
     if r:
         all_results.append(r)
         _print_rope_freqs(r)
+
+    for compare in (cmp_attention_inputs, cmp_expanded_kv):
+        r = compare(args.dir_on, args.dir_off)
+        if r:
+            all_results.append(r)
+            _print_per_layer(r)
 
     # ── packed: attention_output per-layer cos ──
     r = cmp_attn_layer(args.dir_on, args.dir_off, args.layer)
@@ -922,6 +1107,13 @@ def main():
     # ── packed: first_token（attn[0] + logits[0]） ──
     ft_results = cmp_first_token(args.dir_on, args.dir_off)
     for r in ft_results:
+        all_results.append(r)
+        _print_first_token(r)
+
+    # packed[0] is only a provider sentinel.  Check the actual reuser boundary
+    # separately: this is where prefix-last logprob restoration matters.
+    reuser_results = cmp_reuser_first_suffix_token(args.dir_on, args.dir_off)
+    for r in reuser_results:
         all_results.append(r)
         _print_first_token(r)
     # first_token top-K（per-dim）
@@ -974,7 +1166,8 @@ def main():
     if args.output:
         _dump_json(all_results, args.output, args.dir_on, args.dir_off,
                    args.tag, args.dir_off2)
+    return 0 if all_results and all(result.passed for result in all_results) else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

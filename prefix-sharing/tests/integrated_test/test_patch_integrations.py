@@ -1,18 +1,8 @@
 import pytest
 
-from prefix_sharing.backends.torch_ref import TorchReferenceBackend
 from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.integrations.megatron_attention import (
-    IntegrationUnavailable,
-    MegatronAttentionIntegration,
-)
-from prefix_sharing.integrations.patch_manager import PatchManager
-from prefix_sharing.integrations.verl_mcore import (
-    VerlMCoreIntegration,
-    prefix_sharing_enabled,
-    read_ps_config_from_engine_config,
-)
-from prefix_sharing.integrations.verl_fsdp import VerlFSDPIntegration
+from prefix_sharing.integrations.verl_utils import read_ps_config_from_engine_config
+from prefix_sharing.setup.logged_patch import LoggedPatchManager
 
 
 class Target:
@@ -20,9 +10,9 @@ class Target:
         return "original"
 
 
-def test_patch_manager_installs_and_disables_patch():
+def test_logged_patch_manager_installs_and_disables_patch():
     target = Target()
-    manager = PatchManager()
+    manager = LoggedPatchManager()
 
     def replacement(instance):
         return "patched"
@@ -37,9 +27,9 @@ def test_patch_manager_installs_and_disables_patch():
     assert not handle.active
 
 
-def test_patch_manager_context_manager_restores_original():
+def test_logged_patch_manager_context_manager_restores_original():
     target = Target()
-    manager = PatchManager()
+    manager = LoggedPatchManager()
     manager.patch_attr(Target, "method", lambda instance: "patched")
 
     with manager.handle():
@@ -47,74 +37,15 @@ def test_patch_manager_context_manager_restores_original():
     assert target.method() == "original"
 
 
-def test_patch_manager_installs_and_disables_dict_item_patch():
-    registry = {"eager": lambda: "original"}
-    original = registry["eager"]
-    manager = PatchManager()
+def test_logged_patch_manager_restores_mapping_item():
+    manager = LoggedPatchManager()
+    mapping = {"flash_attention_2": "original"}
 
-    def replacement():
-        return "patched"
+    manager.patch_item(mapping, "flash_attention_2", "patched")
 
-    manager.patch_item(registry, "eager", replacement)
-    handle = manager.handle()
-    assert registry["eager"]() == "patched"
-
-    handle.disable()
-    assert registry["eager"] is original
-
-
-def test_megatron_integration_reports_missing_dependency_cleanly(monkeypatch):
-    import importlib
-
-    _original_import = importlib.import_module
-
-    def _mock_import(name, package=None):
-        if name == "megatron.core.transformer.attention":
-            raise ModuleNotFoundError("No module named 'megatron'")
-        return _original_import(name, package=package)
-
-    monkeypatch.setattr(importlib, "import_module", _mock_import)
-
-    config = PrefixSharingConfig(enable_prefix_sharing=True)
-    integration = MegatronAttentionIntegration(config=config, backend=TorchReferenceBackend())
-    with pytest.raises(IntegrationUnavailable, match="Megatron"):
-        integration.install(model_config={})
-
-
-def test_verl_integration_reports_missing_dependency_cleanly(monkeypatch):
-    import importlib
-
-    _original_import = importlib.import_module
-
-    def _mock_import(name, package=None):
-        if name == "verl":
-            raise ModuleNotFoundError("No module named 'verl'")
-        return _original_import(name, package=package)
-
-    monkeypatch.setattr(importlib, "import_module", _mock_import)
-
-    config = PrefixSharingConfig(enable_prefix_sharing=True)
-    integration = VerlMCoreIntegration(config=config)
-    with pytest.raises(IntegrationUnavailable, match="verl"):
-        integration.install(model_config={})
-
-
-def test_verl_fsdp_integration_reports_missing_dependency_cleanly(monkeypatch):
-    import importlib
-
-    _original_import = importlib.import_module
-
-    def _mock_import(name, package=None):
-        if name == "verl":
-            raise ModuleNotFoundError("No module named 'verl'")
-        return _original_import(name, package=package)
-
-    monkeypatch.setattr(importlib, "import_module", _mock_import)
-
-    config = PrefixSharingConfig(enable_prefix_sharing=True)
-    integration = VerlFSDPIntegration(config=config)
-    with pytest.raises(IntegrationUnavailable, match="verl"):
-        integration.install(model_config={})
+    assert mapping["flash_attention_2"] == "patched"
+    manager.handle().disable()
+    assert mapping["flash_attention_2"] == "original"
 
 
 def test_setup_can_load_explicit_verl080_fsdp_patch_set():
@@ -127,6 +58,110 @@ def test_setup_can_load_explicit_verl080_fsdp_patch_set():
     assert "FSDPEngineWithLMHead.forward_step" in patch_set[0].description
     assert patch_set[1].module_name == "transformers.modeling_utils"
     assert "ALL_ATTENTION_FUNCTIONS" in patch_set[1].description
+
+
+
+def test_default_install_selects_all_matching_patch_sets(monkeypatch):
+    from prefix_sharing.setup import _resolve_patch_set_ids
+    from prefix_sharing.setup.compat_matrix import CompatEntry
+    from prefix_sharing.setup.version_guard import DetectedVersions
+
+    monkeypatch.setattr(
+        "prefix_sharing.setup.COMPAT_MATRIX",
+        [
+            CompatEntry("0.8.0.dev", "*", "*", "verl080_fsdp"),
+            CompatEntry("0.8.0.dev", "0.16.1", "0.16.0", "verl080_mcore0161_ms0160"),
+        ],
+    )
+
+    patch_set_ids = _resolve_patch_set_ids(
+        None,
+        versions=DetectedVersions("0.8.0.dev", "0.16.1", "0.16.0"),
+    )
+
+    assert patch_set_ids == ["verl080_fsdp", "verl080_mcore0161_ms0160"]
+
+
+def test_default_install_selects_fsdp_only_when_mcore_dependencies_absent(monkeypatch):
+    from prefix_sharing.setup import _resolve_patch_set_ids
+    from prefix_sharing.setup.compat_matrix import CompatEntry
+    from prefix_sharing.setup.version_guard import DetectedVersions
+
+    monkeypatch.setattr(
+        "prefix_sharing.setup.COMPAT_MATRIX",
+        [
+            CompatEntry("0.8.0.dev", "*", "*", "verl080_fsdp"),
+            CompatEntry("0.8.0.dev", "0.16.1", "0.16.0", "verl080_mcore0161_ms0160"),
+        ],
+    )
+
+    patch_set_ids = _resolve_patch_set_ids(
+        None,
+        versions=DetectedVersions("0.8.0.dev", None, None),
+    )
+
+    assert patch_set_ids == ["verl080_fsdp"]
+
+
+def test_explicit_patch_set_accepts_comma_separated_list():
+    from prefix_sharing.setup import _resolve_patch_set_ids
+
+    patch_set_ids = _resolve_patch_set_ids(
+        " verl080_fsdp, verl080_mcore0161_ms0160 ",
+    )
+
+    assert patch_set_ids == ["verl080_fsdp", "verl080_mcore0161_ms0160"]
+
+
+def test_explicit_patch_set_deduplicates_preserving_order():
+    from prefix_sharing.setup import _resolve_patch_set_ids
+
+    patch_set_ids = _resolve_patch_set_ids(
+        "verl080_fsdp,verl080_fsdp,verl080_mcore0161_ms0160",
+    )
+
+    assert patch_set_ids == ["verl080_fsdp", "verl080_mcore0161_ms0160"]
+
+
+
+def test_install_loads_all_resolved_patch_sets(monkeypatch):
+    from prefix_sharing.setup import install
+    from prefix_sharing.setup.logged_patch import PatchHandle
+    from prefix_sharing.setup.registry import PatchSpec
+
+    loaded_patch_sets = []
+    installed_specs = []
+
+    def fake_load_patch_set(patch_set_id):
+        loaded_patch_sets.append(patch_set_id)
+        return [
+            PatchSpec(
+                module_name=f"fake.{patch_set_id}",
+                target_getter=lambda module: (module, "target"),
+                patch_factory=lambda original: original,
+                description=f"patch {patch_set_id}",
+            )
+        ]
+
+    def fake_install_specs(specs):
+        installed_specs.extend(specs)
+        return PatchHandle([], specs=list(specs))
+
+    monkeypatch.setattr(
+        "prefix_sharing.setup._resolve_patch_set_ids",
+        lambda patch_set_id: ["verl080_fsdp", "verl080_mcore0161_ms0160"],
+    )
+    monkeypatch.setattr("prefix_sharing.setup._load_patch_set", fake_load_patch_set)
+    monkeypatch.setattr("prefix_sharing.setup.PatchRegistry.install_specs", fake_install_specs)
+
+    handle = install()
+
+    assert loaded_patch_sets == ["verl080_fsdp", "verl080_mcore0161_ms0160"]
+    assert [spec.module_name for spec in installed_specs] == [
+        "fake.verl080_fsdp",
+        "fake.verl080_mcore0161_ms0160",
+    ]
+    assert handle.describe().startswith("PatchHandle")
 
 
 def test_prefix_sharing_config_from_raw_accepts_nested_config():
@@ -205,17 +240,3 @@ def test_prefix_sharing_config_from_raw_accepts_env_enable(monkeypatch):
     config = PrefixSharingConfig.from_raw(None)
 
     assert config.enable_prefix_sharing is True
-
-
-def test_prefix_sharing_enabled_propagates_install_failure(monkeypatch):
-    class FakeIntegration:
-        def __init__(self, config, backend=None):
-            pass
-
-        def install(self, model_config=None):
-            raise RuntimeError("install failed")
-
-    monkeypatch.setattr("prefix_sharing.integrations.verl_mcore.VerlMCoreIntegration", FakeIntegration)
-    with pytest.raises(RuntimeError, match="install failed"):
-        with prefix_sharing_enabled(PrefixSharingConfig(enable_prefix_sharing=True)):
-            pass

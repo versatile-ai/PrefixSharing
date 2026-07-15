@@ -3,15 +3,14 @@
 Patch 目标：
 1. FSDPEngineWithLMHead.forward_step → dense FSDP PrefixSharing forward helper
 
-当前 patch set 是 FSDP 开源线的显式开发入口，需通过
-``prefix_sharing.setup.install("verl080_fsdp")`` 安装；不要依赖默认兼容矩阵
-自动选择，避免与 Megatron/MindSpeed patch set 混用。
+当前 patch set 是 FSDP 开源线的默认入口，可通过兼容矩阵自动选择，也可通过
+``prefix_sharing.setup.install("verl080_fsdp")`` 显式安装。
 """
 
 from prefix_sharing.setup.registry import PatchSpec
 
 from .forward_step import patch_fsdp_forward_step
-from .attention import patch_transformers_attention
+from .attention import install_prefix_sharing_attention_wrappers
 
 
 PATCH_SET: list[PatchSpec] = [
@@ -27,15 +26,15 @@ PATCH_SET: list[PatchSpec] = [
     ),
     PatchSpec(
         module_name="transformers.modeling_utils",
-        target_getter=lambda mod: (
+        installer=lambda mod, manager: install_prefix_sharing_attention_wrappers(
             mod.ALL_ATTENTION_FUNCTIONS,
-            "get_interface",
+            manager,
         ),
-        patch_factory=patch_transformers_attention,
         description=(
-            "ALL_ATTENTION_FUNCTIONS.get_interface → PrefixSharing-aware "
+            "ALL_ATTENTION_FUNCTIONS entries → PrefixSharing-aware "
             "(HF attention KV store/load on Q-path kept tokens)"
         ),
-        # transformers 在 worker 启动早期就加载，无需 eager；context 不激活时透传。
+        eager=True,
     ),
 ]
+
