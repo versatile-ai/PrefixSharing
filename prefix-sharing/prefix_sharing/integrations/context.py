@@ -10,7 +10,7 @@ from typing import Any, Iterator
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.observability import PrefixSharingStats
 from prefix_sharing.core.planner import PrefixSharingPlan
-from prefix_sharing.core.prefix_store import PrefixAttentionStore
+from prefix_sharing.core.prefix_store import PrefixActivationStore, PrefixAttentionStore
 from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
 
 
@@ -36,7 +36,7 @@ class PrefixSharingRuntimeContext:
     prefix_sharing_plan: PrefixSharingPlan
     packed_batch_layout: PackedBatchLayout
     parallel_info: MegatronParallelInfo
-    store: PrefixAttentionStore
+    store: PrefixActivationStore
     attention_backend: Any | None = None
     kept_position_ids: Any | None = None
     prefix_last_restore_indices: list[PackedPrefixLastRestoreIndex] = field(default_factory=list)
@@ -53,7 +53,7 @@ class PrefixSharingRuntimeContext:
     """
     stats: PrefixSharingStats | None = None
 
-    def __init__(self, runtime_state: Any, store: PrefixAttentionStore) -> None:
+    def __init__(self, runtime_state: Any, store: PrefixActivationStore) -> None:
         self.prefix_sharing_plan = runtime_state.prefix_sharing_plan
         self.packed_batch_layout = runtime_state.packed_batch_layout
         self.parallel_info = runtime_state.parallel_info
@@ -84,6 +84,21 @@ class PrefixSharingRuntimeContext:
 
 def current_prefix_sharing_context() -> PrefixSharingRuntimeContext | None:
     return _current_context.get()
+
+
+def _create_store(runtime_state: Any) -> PrefixActivationStore:
+    """Create the appropriate prefix activation store based on model_type.
+
+    When ``model_type`` is ``"deepseek4"``, a :class:`G2AttentionStore` is
+    returned.  Otherwise the default :class:`PrefixAttentionStore` is used
+    for backward compatibility.
+    """
+    model_type = getattr(runtime_state, "model_type", "text_only_causal_lm")
+    if model_type == "deepseek4":
+        from prefix_sharing.core.prefix_store import G2AttentionStore
+
+        return G2AttentionStore()
+    return PrefixAttentionStore()
 
 
 def _build_prefix_last_restore_indices(
@@ -130,7 +145,7 @@ def prefix_sharing_runtime_context(
         yield None
         return
 
-    store = PrefixAttentionStore()
+    store = _create_store(prefix_sharing_runtime_state)
     ctx = PrefixSharingRuntimeContext(prefix_sharing_runtime_state, store)
     token = _current_context.set(ctx)
     try:

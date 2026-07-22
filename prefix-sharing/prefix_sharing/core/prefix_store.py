@@ -54,6 +54,7 @@ from typing import Any
 
 PREFIX_STATE_TYPE_ATTENTION_KV = "attention_kv"
 PREFIX_STATE_TYPE_DELTANET_STATE = "deltanet_state"
+PREFIX_STATE_TYPE_G2_ATTENTION = "g2_attention"
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,100 @@ class PrefixActivationStore:
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError(f"{self.__class__.__name__} is closed")
+
+
+@dataclass(frozen=True)
+class StoredG2Activation:
+    """DeepSeek4 G2 MLA prefix activation — one entry covers all expansion needs.
+
+    Unlike :class:`StoredAttentionKV` which holds separate K/V tensors per
+    head, this stores the compressed single-tensor ``kv`` produced by MLA
+    (shape ``[s, 512]``), along with optional compressed KV, attention
+    output, MHC residual/post/comb, and DSA indexer scores.
+
+    All fields can be ``None`` (incremental storage: each store call updates
+    a subset of fields).  ``stored_len`` tracks the full stored length:
+    provider stores its own ``valid_len``; reuser stores ``prefix_len +
+    valid_len`` for transitive reuse.
+    """
+
+    kv: Any | None = None
+    kv_compress: Any | None = None
+    attn_o: Any | None = None
+    residual_prefix: Any | None = None
+    post_prefix: Any | None = None
+    comb_prefix: Any | None = None
+    indexer_score: Any | None = None
+    stored_len: int = 0
+
+
+class G2AttentionStore(PrefixActivationStore):
+    """Typed store for DeepSeek4 G2 attention prefix activations.
+
+    Follows the same base + typed wrapper pattern as
+    :class:`PrefixAttentionStore` and :class:`PrefixDeltanetStore`.
+    """
+
+    def store(
+        self,
+        slot_id: PrefixActivationSlotId,
+        *,
+        kv: Any | None = None,
+        kv_compress: Any | None = None,
+        attn_o: Any | None = None,
+        residual_prefix: Any | None = None,
+        post_prefix: Any | None = None,
+        comb_prefix: Any | None = None,
+        indexer_score: Any | None = None,
+        stored_len: int,
+        overwrite: bool = False,
+    ) -> None:
+        if slot_id.prefix_state_type != PREFIX_STATE_TYPE_G2_ATTENTION:
+            raise ValueError(
+                "G2AttentionStore requires prefix_state_type='g2_attention'"
+            )
+        if stored_len < 0:
+            raise ValueError("stored_len must be >= 0")
+
+        if overwrite and self.contains(slot_id):
+            existing = self.load(slot_id)
+            entry = StoredG2Activation(
+                kv=kv if kv is not None else existing.kv,
+                kv_compress=kv_compress if kv_compress is not None else existing.kv_compress,
+                attn_o=attn_o if attn_o is not None else existing.attn_o,
+                residual_prefix=(
+                    residual_prefix if residual_prefix is not None
+                    else existing.residual_prefix
+                ),
+                post_prefix=post_prefix if post_prefix is not None else existing.post_prefix,
+                comb_prefix=comb_prefix if comb_prefix is not None else existing.comb_prefix,
+                indexer_score=(
+                    indexer_score if indexer_score is not None
+                    else existing.indexer_score
+                ),
+                stored_len=max(existing.stored_len, stored_len),
+            )
+        else:
+            entry = StoredG2Activation(
+                kv=kv,
+                kv_compress=kv_compress,
+                attn_o=attn_o,
+                residual_prefix=residual_prefix,
+                post_prefix=post_prefix,
+                comb_prefix=comb_prefix,
+                indexer_score=indexer_score,
+                stored_len=stored_len,
+            )
+
+        self.store_entry(slot_id, entry=entry, overwrite=overwrite)
+
+    def load(self, slot_id: PrefixActivationSlotId) -> StoredG2Activation:
+        entry = self.load_entry(slot_id)
+        if not isinstance(entry, StoredG2Activation):
+            raise TypeError(
+                f"stored prefix state is not G2 activation for {slot_id}"
+            )
+        return entry
 
 
 class PrefixAttentionStore(PrefixActivationStore):
