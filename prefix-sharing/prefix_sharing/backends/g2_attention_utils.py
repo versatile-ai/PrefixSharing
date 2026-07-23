@@ -35,50 +35,8 @@ def _merge_g2_fields(
     return StoredG2Activation(
         kv=new_tensor if field == "kv" else existing.kv,
         kv_compress=new_tensor if field == "kv_compress" else existing.kv_compress,
-        attn_o=new_tensor if field == "attn_o" else existing.attn_o,
-        residual_prefix=(
-            new_tensor if field == "residual_prefix" else existing.residual_prefix
-        ),
-        post_prefix=new_tensor if field == "post_prefix" else existing.post_prefix,
-        comb_prefix=new_tensor if field == "comb_prefix" else existing.comb_prefix,
-        indexer_score=(
-            new_tensor if field == "indexer_score" else existing.indexer_score
-        ),
+        indexer_k=new_tensor if field == "indexer_k" else existing.indexer_k,
         stored_len=max(existing.stored_len, new_tensor.shape[0]),
-    )
-
-
-def _merge_g2_transformer_fields(
-    existing: StoredG2Activation | None,
-    *,
-    residual_prefix: Any,
-    post_prefix: Any,
-    comb_prefix: Any,
-    valid_len: int,
-) -> StoredG2Activation:
-    """Merge transformer fields (residual/post/comb) while retaining attention fields.
-
-    Unlike :func:`_merge_g2_fields`, this updates three fields at once, which
-    avoids multiple store calls when the transformer patch writes its data.
-    When *existing* is ``None`` (transformer patch runs before attention patch),
-    a fresh entry with only transformer fields is returned.
-    """
-    if existing is None:
-        return StoredG2Activation(
-            residual_prefix=residual_prefix,
-            post_prefix=post_prefix,
-            comb_prefix=comb_prefix,
-            stored_len=valid_len,
-        )
-    return StoredG2Activation(
-        kv=existing.kv,
-        kv_compress=existing.kv_compress,
-        attn_o=existing.attn_o,
-        residual_prefix=residual_prefix,
-        post_prefix=post_prefix,
-        comb_prefix=comb_prefix,
-        indexer_score=existing.indexer_score,
-        stored_len=max(existing.stored_len, valid_len),
     )
 
 

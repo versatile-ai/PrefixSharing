@@ -146,26 +146,21 @@ class PrefixActivationStore:
 
 @dataclass(frozen=True)
 class StoredG2Activation:
-    """DeepSeek4 G2 MLA prefix activation — one entry covers all expansion needs.
+    """DeepSeek4 G2 MLA prefix activation — key-side data for reuser reuse.
 
-    Unlike :class:`StoredAttentionKV` which holds separate K/V tensors per
-    head, this stores the compressed single-tensor ``kv`` produced by MLA
-    (shape ``[s, 512]``), along with optional compressed KV, attention
-    output, MHC residual/post/comb, and DSA indexer scores.
+    Stores three key-side tensors produced during attention forward:
+
+    - ``kv``: raw MLA-compressed KV ``[s, 512]`` (SWA)
+    - ``kv_compress``: compressed KV ``[s//r, 512]`` (HCA/CSA coarse)
+    - ``indexer_k``: DSA Indexer key embeddings ``[s//4, 1, 128]`` (ratio=4 only)
 
     All fields can be ``None`` (incremental storage: each store call updates
-    a subset of fields).  ``stored_len`` tracks the full stored length:
-    provider stores its own ``valid_len``; reuser stores ``prefix_len +
-    valid_len`` for transitive reuse.
+    a subset of fields).  ``stored_len`` tracks the full stored length.
     """
 
     kv: Any | None = None
     kv_compress: Any | None = None
-    attn_o: Any | None = None
-    residual_prefix: Any | None = None
-    post_prefix: Any | None = None
-    comb_prefix: Any | None = None
-    indexer_score: Any | None = None
+    indexer_k: Any | None = None
     stored_len: int = 0
 
 
@@ -182,11 +177,7 @@ class G2AttentionStore(PrefixActivationStore):
         *,
         kv: Any | None = None,
         kv_compress: Any | None = None,
-        attn_o: Any | None = None,
-        residual_prefix: Any | None = None,
-        post_prefix: Any | None = None,
-        comb_prefix: Any | None = None,
-        indexer_score: Any | None = None,
+        indexer_k: Any | None = None,
         stored_len: int,
         overwrite: bool = False,
     ) -> None:
@@ -202,28 +193,14 @@ class G2AttentionStore(PrefixActivationStore):
             entry = StoredG2Activation(
                 kv=kv if kv is not None else existing.kv,
                 kv_compress=kv_compress if kv_compress is not None else existing.kv_compress,
-                attn_o=attn_o if attn_o is not None else existing.attn_o,
-                residual_prefix=(
-                    residual_prefix if residual_prefix is not None
-                    else existing.residual_prefix
-                ),
-                post_prefix=post_prefix if post_prefix is not None else existing.post_prefix,
-                comb_prefix=comb_prefix if comb_prefix is not None else existing.comb_prefix,
-                indexer_score=(
-                    indexer_score if indexer_score is not None
-                    else existing.indexer_score
-                ),
+                indexer_k=indexer_k if indexer_k is not None else existing.indexer_k,
                 stored_len=max(existing.stored_len, stored_len),
             )
         else:
             entry = StoredG2Activation(
                 kv=kv,
                 kv_compress=kv_compress,
-                attn_o=attn_o,
-                residual_prefix=residual_prefix,
-                post_prefix=post_prefix,
-                comb_prefix=comb_prefix,
-                indexer_score=indexer_score,
+                indexer_k=indexer_k,
                 stored_len=stored_len,
             )
 

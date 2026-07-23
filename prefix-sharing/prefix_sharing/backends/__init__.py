@@ -10,7 +10,6 @@ from prefix_sharing.backends.g2_attention_utils import (
     _adjust_cu_seqlens_for_batch,
     _compute_cmp_lengths,
     _merge_g2_fields,
-    _merge_g2_transformer_fields,
     _split_by_cu_seqlens,
 )
 from prefix_sharing.backends.torch_ref import TorchReferenceBackend
@@ -27,7 +26,6 @@ __all__ = [
     "_adjust_cu_seqlens_for_batch",
     "_compute_cmp_lengths",
     "_merge_g2_fields",
-    "_merge_g2_transformer_fields",
     "_split_by_cu_seqlens",
     "build_block_causal_mask",
     "get_backend_instance",
