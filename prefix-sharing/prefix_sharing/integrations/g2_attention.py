@@ -10,6 +10,7 @@ from __future__ import annotations
 import torch
 
 from prefix_sharing.backends.g2_attention_utils import (
+    _adjust_cu_seqlens_for_batch,
     _compute_cmp_lengths,
     _merge_g2_fields,
     _split_by_cu_seqlens,
@@ -190,6 +191,41 @@ def _g2_kv_store_or_expand(
                     idxk_rows[batch_idx][:idxk_s]], dim=0)
                 new_idxk.append(expanded_idxk)
 
+            # Recompute topk for expanded key space
+            if compress_topk_idxs is not None and compress_ratio > 1:
+                if hasattr(attention_module, 'indexer') and attention_module.indexer is not None:
+                    # ratio=4: re-score with expanded indexer_k
+                    if expanded_idxk is not None:
+                        q = ...  # q_r from Phase 2 — needs caller to pass it in
+                        w = ...  # w_r from Phase 2
+                        x = ...  # dsa_hidden from Phase 2
+                        # TODO: wire q_r, w_r, x from patched_forward caller
+                        compress_topk_idxs[batch_idx] = attention_module.indexer.forward_with_scores_compress(
+                            x=x, q=q, k=expanded_idxk, w=w,
+                            mask=None, packed_seq_params=packed_seq_params,
+                            start_pos=start_pos, index_topk=attention_module.indexer.index_topk,
+                            offset=0, compress_ratio=compress_ratio)[0][batch_idx:batch_idx+1]
+                else:
+                    # ratio=128: recompute by position with expanded seqlen
+                    tp_size = 1
+                    cp_size = 1
+                    try:
+                        from megatron.core import parallel_state
+                        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+                        cp_size = parallel_state.get_context_parallel_world_size()
+                    except (ImportError, RuntimeError, AssertionError):
+                        pass
+                    q_len_local = valid_len
+                    q_len = q_len_local * tp_size if sequence_parallel else q_len_local
+                    q_len_global = q_len * cp_size if cp_size > 1 else q_len
+                    expanded_seqlen = prefix_len + q_len_global
+                    bsz = compress_topk_idxs.shape[0]
+                    new_idxs = attention_module.get_compress_topk_idxs(
+                        compress_ratio, bsz, expanded_seqlen,
+                        start_pos=start_pos, offset=0, cp_shard=kv_allgather)
+                    compress_topk_idxs[batch_idx, :q_len_local, :] = \
+                        new_idxs[batch_idx, -q_len_local:, :]
+
             # Store back for transitive reuse
             own_slot = PrefixActivationSlotId(
                 plan.forward_id, plan.micro_batch_id, layer_id,
@@ -205,6 +241,11 @@ def _g2_kv_store_or_expand(
                 new_cmp.append(cmp_rows[batch_idx][:valid_len // compress_ratio])
             if idxk_rows:
                 new_idxk.append(idxk_rows[batch_idx][:valid_len // compress_ratio])
+
+    # Adjust cu_seqlens for reusers (offsets all subsequent entries)
+    if packed_seq_params is not None:
+        packed_seq_params = _adjust_cu_seqlens_for_batch(
+            packed_seq_params, plan, compress_ratio)
 
     result_kv = torch.cat(new_kv, dim=0)
     result_cmp = torch.cat(new_cmp, dim=0) if new_cmp else (kv_compress if has_cmp else None)
