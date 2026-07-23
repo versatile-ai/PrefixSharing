@@ -63,4 +63,13 @@ COMPAT_MATRIX: list[CompatEntry] = [
         notes="纯 Megatron + MindSpeed 训练; 无 verl; "
               "仅 patch Attention.forward",
     ),
+    # 组合三：DeepSeek V4 Flash standalone pretrain (non-verl path)
+    CompatEntry(
+        verl=None,
+        megatron_core="0.16.1",
+        mindspeed="0.16.0",
+        patch_set_id="mindspeed_deepseek4",
+        notes="DeepSeek V4 Flash standalone pretrain; "
+              "megatron-core 0.16.1 + mindspeed 0.16.0 + mindspeed_llm 26.0.0.dev",
+    ),
 ]
