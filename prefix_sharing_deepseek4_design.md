@@ -1,3 +1,12 @@
+# ⛔ 本文档已作废
+
+> **作废日期**：2026-07-23
+> **作废原因**：该方案基于一个根本错误——假定 Attention 输出长度 = KV 长度 (P+S)，但实际 Attention 输出长度 = Q 长度 (S)。详见 `prefix-sharing/docs/design_revision_summary.md` 和新设计文档 `prefix_sharing_deepseek4_design_v2.md`。
+>
+> **以下为作废内容，仅供参考，不得用于实现。**
+
+---
+
 # PrefixSharing → DeepSeek V4 集成设计方案
 
 > **文档定位**：本文档描述在 **PrefixSharing 项目**（`/Users/kevin/code/PrefixSharing`）中新增 DeepSeek V4 支持的完整设计方案。通过 monkey-patch 方式注入 MindSpeed-LLM 的 DeepSeek V4 训练流程，不改动 MindSpeed 源码。

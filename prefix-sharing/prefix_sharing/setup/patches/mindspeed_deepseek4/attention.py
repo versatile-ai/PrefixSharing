@@ -54,7 +54,7 @@ def patch_g2_attention(original_forward):
         from mindspeed_llm.tasks.models.transformer.deepseek4.deepseek_utils import (
             apply_rotary_emb)
         from mindspeed_llm.ops.npu_sparse_flash_mla import npu_sparse_flash_mla
-        from mindspeed_llm.tasks.models.dsa_indexer import (
+        from mindspeed_llm.tasks.models.transformer.dsa_indexer import (
             DSAIndexerLossAutoScaler, compute_dsa_indexer_loss_dsv4, get_attn_scores,
             DSAIndexerLossLoggingHelper)
 

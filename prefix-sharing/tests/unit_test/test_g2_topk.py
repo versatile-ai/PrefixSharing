@@ -28,7 +28,7 @@ def _make_plan(*, batch_size, prefix_lens, original_lengths):
 
 @dataclass
 class MockContext:
-    store: G2AttentionStore; packed_batch_layout: object; plan: object; parallel_info: object = None
+    store: G2AttentionStore; packed_batch_layout: object; prefix_sharing_plan: object; parallel_info: object = None
     def __post_init__(self):
         if self.parallel_info is None:
             from prefix_sharing.integrations.parallel_info import MegatronParallelInfo
@@ -59,7 +59,7 @@ def test_ratio128_called_with_expanded_seqlen():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=2, prefix_lens=[0, 256], original_lengths=[256, 256])
     layout = PackedBatchLayout.from_valid_lengths([256, 128])
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
     p_kv = torch.randn(256, 512)
     _g2_store_with_kwargs(store, _slot(plan, 0), StoredG2Activation(kv=p_kv, stored_len=256))
     kv = torch.cat([p_kv, torch.randn(128, 512)], dim=0)
@@ -82,7 +82,7 @@ def test_ratio128_start_pos_passthrough():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=2, prefix_lens=[0, 256], original_lengths=[256, 256])
     layout = PackedBatchLayout.from_valid_lengths([256, 128])
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
     p_kv = torch.randn(256, 512)
     _g2_store_with_kwargs(store, _slot(plan, 0), StoredG2Activation(kv=p_kv, stored_len=256))
     kv = torch.cat([p_kv, torch.randn(128, 512)], dim=0)
@@ -125,7 +125,7 @@ def test_ratio4_expanded_k_passed():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=2, prefix_lens=[0, 8], original_lengths=[8, 8])
     layout = PackedBatchLayout.from_valid_lengths([8, 4])
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
     p_kv = torch.randn(8, 512); p_idxk = torch.randn(2, 1, 128)
     _g2_store_with_kwargs(store, _slot(plan, 0), StoredG2Activation(kv=p_kv, indexer_k=p_idxk, stored_len=8))
     kv = torch.cat([p_kv, torch.randn(4, 512)], dim=0)
@@ -152,7 +152,7 @@ def test_cu_seqlens_adjust_in_expand():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=2, prefix_lens=[0, 256], original_lengths=[256, 256])
     layout = PackedBatchLayout.from_valid_lengths([256, 128])
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
     p_kv = torch.randn(256, 512)
     _g2_store_with_kwargs(store, _slot(plan, 0), StoredG2Activation(kv=p_kv, stored_len=256))
     kv = torch.cat([p_kv, torch.randn(128, 512)], dim=0)

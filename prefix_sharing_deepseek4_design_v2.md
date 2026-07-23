@@ -224,6 +224,21 @@ P=3, S=3, r=4:
 
 **Phase 2**：provider 存储最后 `r - P%r` 个 token 的 raw hidden。Reuser 用 provider tail + suffix head 重跑 `self.compressor()` 得到正确的跨边界压缩块。
 
+### 4.6 实现注意事项：packed 内的 dim 混排
+
+DeepSeek V4 只走 THD packed 格式，所有张量在 dim=0 维度上拼接。但在 packed 内部，不同张量的序列维位置不同：
+
+| 张量 | Shape | 序列维 | split/cat 操作 |
+|------|-------|--------|:--:|
+| `kv` | `[total_tokens, b, 512]` | dim=0 | ✅ 直接操作 |
+| `kv_compress` | `[total_cmp, b, 512]` | dim=0 | ✅ 直接操作 |
+| `indexer_k` | `[total_idxk, b, 1, 128]` | dim=0 | ✅ 直接操作 |
+| `compress_topk_idxs` | `[b, total_q, topk]` | **dim=1** | ❌ 不能走 split/cat |
+
+`compress_topk_idxs` 的 dim=0 是 batch，dim=1 才是序列。如果对它调 `_split_by_cu_seqlens` 会按 batch 拆而非按序列拆。**处理方式：topk 走重算（§4.4），不走 split/store/expand。**
+
+`_split_by_cu_seqlens` 仅用于 dim=0 为序列维的张量（kv / kv_compress / indexer_k）。`_g2_kv_store_or_expand` 内部对这三种张量和 topk 走不同分支。
+
 ## 5. 训练流程集成
 
 **文件**：`prefix_sharing/integrations/g2_batch.py`

@@ -106,7 +106,7 @@ def _g2_kv_store_or_expand(
     Topk recomputation and cu_seqlens adjustment deferred to Task 3.
     """
     layout = ctx.packed_batch_layout
-    plan = ctx.plan
+    plan = ctx.prefix_sharing_plan
     tp_rank = ctx.parallel_info.tp_rank
     layer_id = attention_module.layer_number if attention_module is not None else 0
 

@@ -56,7 +56,7 @@ def _make_plan(*, batch_size, prefix_lens, original_lengths):
 class MockContext:
     store: G2AttentionStore
     packed_batch_layout: PackedBatchLayout
-    plan: object
+    prefix_sharing_plan: object
     parallel_info: object = None
 
     def __post_init__(self):
@@ -91,7 +91,7 @@ def test_provider_store_kv():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=1, prefix_lens=[0], original_lengths=[6])
     layout = PackedBatchLayout.from_valid_lengths([6])
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
 
     kv = torch.randn(6, 512)
     result_kv, _, _, _, _ = _expand_and_return(ctx, kv)
@@ -109,7 +109,7 @@ def test_provider_store_kv_compress():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=1, prefix_lens=[0], original_lengths=[256])
     layout = PackedBatchLayout.from_valid_lengths([256])
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
 
     kv = torch.randn(256, 512)
     cmp = torch.randn(2, 512)  # 256//128=2
@@ -126,7 +126,7 @@ def test_provider_store_indexer_k():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=1, prefix_lens=[0], original_lengths=[8])
     layout = PackedBatchLayout.from_valid_lengths([8])
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
 
     kv = torch.randn(8, 512)
     idxk = torch.randn(2, 1, 128)  # 8//4=2
@@ -144,7 +144,7 @@ def test_non_reuser_not_stored():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=2, prefix_lens=[0, 0], original_lengths=[6, 6])
     layout = PackedBatchLayout.from_valid_lengths([6, 6])
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
 
     kv = torch.randn(12, 512)
     _expand_and_return(ctx, kv)
@@ -158,7 +158,7 @@ def test_provider_returns_original():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=1, prefix_lens=[0], original_lengths=[128])
     layout = PackedBatchLayout.from_valid_lengths([128])
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
 
     kv = torch.randn(128, 512)
     r_kv, r_cmp, r_idxk, r_topk, r_psp = _expand_and_return(ctx, kv)
@@ -178,7 +178,7 @@ def test_reuser_expand_kv():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=2, prefix_lens=[0, 128], original_lengths=[256, 256])
     layout = PackedBatchLayout.from_valid_lengths([256, 128])  # S=128
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
 
     p_kv = torch.randn(256, 512)
     _g2_store_with_kwargs(store, _slot(plan, batch_idx=0),
@@ -200,7 +200,7 @@ def test_reuser_expand_kv_compress():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=2, prefix_lens=[0, 256], original_lengths=[256, 256])
     layout = PackedBatchLayout.from_valid_lengths([256, 128])  # S=128
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
     r = 128
 
     p_kv = torch.randn(256, 512)
@@ -223,7 +223,7 @@ def test_reuser_expand_indexer_k():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=2, prefix_lens=[0, 8], original_lengths=[8, 8])
     layout = PackedBatchLayout.from_valid_lengths([8, 4])  # S=4
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
     r = 4
 
     p_kv = torch.randn(8, 512)
@@ -245,7 +245,7 @@ def test_reuser_preserves_own_suffix():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=2, prefix_lens=[0, 128], original_lengths=[256, 256])
     layout = PackedBatchLayout.from_valid_lengths([256, 128])  # S=128
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
 
     p_kv = torch.randn(256, 512)
     _g2_store_with_kwargs(store, _slot(plan, batch_idx=0),
@@ -264,7 +264,7 @@ def test_transitive_reuse():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=3, prefix_lens=[0, 128, 256], original_lengths=[256, 256, 256])
     layout = PackedBatchLayout.from_valid_lengths([256, 128, 128])  # S1=128, S2=128
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
 
     p_kv = torch.randn(256, 512)
     _g2_store_with_kwargs(store, _slot(plan, batch_idx=0),
@@ -292,7 +292,7 @@ def test_compress_ratio_le1_no_cmp():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=1, prefix_lens=[0], original_lengths=[6])
     layout = PackedBatchLayout.from_valid_lengths([6])
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
 
     kv = torch.randn(6, 512)
     r_kv, r_cmp, r_idxk, _, _ = _expand_and_return(ctx, kv, kv_compress=None, compress_ratio=1)
@@ -305,7 +305,7 @@ def test_indexer_k_none_for_ratio128():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=2, prefix_lens=[0, 256], original_lengths=[256, 256])
     layout = PackedBatchLayout.from_valid_lengths([256, 128])
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
 
     p_kv = torch.randn(256, 512)
     _g2_store_with_kwargs(store, _slot(plan, batch_idx=0),
@@ -322,7 +322,7 @@ def test_aligned_prefix_assert():
     store = G2AttentionStore()
     plan = _make_plan(batch_size=2, prefix_lens=[0, 3], original_lengths=[128, 128])
     layout = PackedBatchLayout.from_valid_lengths([128, 125])  # P=3, S=125
-    ctx = MockContext(store=store, packed_batch_layout=layout, plan=plan)
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
 
     p_kv = torch.randn(128, 512)
     _g2_store_with_kwargs(store, _slot(plan, batch_idx=0),
