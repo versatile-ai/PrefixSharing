@@ -141,6 +141,41 @@ def test_ratio4_expanded_k_passed():
     assert Captured4[-1]["k_shape"] == (3, 1, 128)
 
 
+def test_ratio4_score_updated():
+    """Ratio=4: compress_topk_score updated for reuser (not stale Phase 2 value)."""
+    from prefix_sharing.backends.packed_layout import PackedBatchLayout
+
+    store = G2AttentionStore()
+    plan = _make_plan(batch_size=2, prefix_lens=[0, 8], original_lengths=[8, 8])
+    layout = PackedBatchLayout.from_valid_lengths([8, 4])
+    ctx = MockContext(store=store, packed_batch_layout=layout, prefix_sharing_plan=plan)
+    p_kv = torch.randn(8, 512); p_idxk = torch.randn(2, 1, 128)
+    _g2_store_with_kwargs(store, _slot(plan, 0), StoredG2Activation(kv=p_kv, indexer_k=p_idxk, stored_len=8))
+    kv = torch.cat([p_kv, torch.randn(4, 512)], dim=0)
+    idxk = torch.cat([p_idxk, torch.randn(1, 1, 128)], dim=0)
+    topk = torch.zeros(2, 8, 512, dtype=torch.int64)
+
+    # Phase 2 produced a stale score (suffix-only key space)
+    stale_score = torch.full((2, 8, 512), -1.0)
+    score = stale_score.clone()
+
+    mock_q = torch.randn(4, 64, 128)
+    mock_w = torch.randn(4, 64)
+    mock_x = torch.randn(4, 1, 4096)
+
+    result = _g2_kv_store_or_expand(ctx, kv, None, idxk, topk, None, 4, Mock4Module(), 0, False, False,
+                                    query_index=mock_q, indexer_weights=mock_w, dsa_hidden=mock_x,
+                                    compress_topk_score=score)
+
+    # result[5] is the updated score
+    updated_score = result[5]
+    assert updated_score is not None, "score should be returned"
+    # Reuser row (batch_idx=1) should have been updated with new (non-negative) score
+    # Mock returns zeros, so reuser values should be 0≠-1
+    assert not torch.equal(updated_score[1, :4, :3], stale_score[1, :4, :3]), \
+        "score should be updated for reuser (no longer stale)"
+
+
 # ── cu_seqlens ───────────────────────────────────────────────────────
 
 
