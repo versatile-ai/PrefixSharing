@@ -76,11 +76,12 @@ def _expand_and_return(ctx, kv, kv_compress=None, indexer_k=None,
                        compress_ratio=128, attn_module=None,
                        start_pos=0, kv_allgather=False, sequence_parallel=False):
     """Shorthand for calling _g2_kv_store_or_expand."""
-    return _g2_kv_store_or_expand(
+    result = _g2_kv_store_or_expand(
         ctx, kv, kv_compress, indexer_k,
         compress_topk_idxs, packed_seq_params,
         compress_ratio, attn_module,
         start_pos, kv_allgather, sequence_parallel)
+    return result[:5]  # drop compress_topk_score (not used in unit tests)
 
 
 # ── Provider ──────────────────────────────────────────────────────────

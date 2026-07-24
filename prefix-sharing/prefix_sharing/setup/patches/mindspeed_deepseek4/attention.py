@@ -144,7 +144,8 @@ def patch_g2_attention(original_forward):
 
         # ═══════════ Hook: Store / Expand ═══════════
         indexer_k = key_index if self.indexer is not None else None
-        kv, kv_compress, indexer_k, compress_topk_idxs, packed_seq_params = (
+        kv, kv_compress, indexer_k, compress_topk_idxs, packed_seq_params, \
+            compress_topk_score = (
             _g2_kv_store_or_expand(
                 ctx, kv, kv_compress, indexer_k,
                 compress_topk_idxs, packed_seq_params,
@@ -153,7 +154,8 @@ def patch_g2_attention(original_forward):
                 query_index=query_index,
                 indexer_weights=weights,
                 dsa_hidden=dsa_hidden_states,
-                attention_mask=attention_mask))
+                attention_mask=attention_mask,
+                compress_topk_score=compress_topk_score))
         # ═════════════════════════════════════════════
 
         # ── Phase 4-5: copied orchestration ──

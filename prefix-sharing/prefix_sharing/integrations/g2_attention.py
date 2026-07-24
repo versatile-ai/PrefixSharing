@@ -95,10 +95,11 @@ def _g2_kv_store_or_expand(
     kv_allgather: bool,
     sequence_parallel: bool,
     *,
-    query_index=None,       # ratio=4: q_r from Phase 2
-    indexer_weights=None,   # ratio=4: w_r from Phase 2
-    dsa_hidden=None,        # ratio=4: dsa_hidden from Phase 2
-    attention_mask=None,    # ratio=4: forward_with_scores_compress mask
+    query_index=None,            # ratio=4: q_r from Phase 2
+    indexer_weights=None,        # ratio=4: w_r from Phase 2
+    dsa_hidden=None,             # ratio=4: dsa_hidden from Phase 2
+    attention_mask=None,         # ratio=4: forward_with_scores_compress mask
+    compress_topk_score=None,    # ratio=4: updated by re-scoring
 ):
     """Provider store / Reuser expand for all key-side data.
 
@@ -201,7 +202,7 @@ def _g2_kv_store_or_expand(
                 if hasattr(attention_module, 'indexer') and attention_module.indexer is not None:
                     # ratio=4: re-score with expanded indexer_k
                     if expanded_idxk is not None and query_index is not None:
-                        new_topk, _ = attention_module.indexer.forward_with_scores_compress(
+                        new_topk, new_score = attention_module.indexer.forward_with_scores_compress(
                             x=dsa_hidden, q=query_index, k=expanded_idxk, w=indexer_weights,
                             mask=attention_mask, packed_seq_params=packed_seq_params,
                             start_pos=start_pos, index_topk=attention_module.indexer.index_topk,
@@ -210,6 +211,9 @@ def _g2_kv_store_or_expand(
                         topk_len = new_topk.shape[-1]
                         compress_topk_idxs[batch_idx, :q_len_local, :topk_len] = \
                             new_topk[batch_idx, :q_len_local, :]
+                        if compress_topk_score is not None:
+                            compress_topk_score[batch_idx, :q_len_local, :topk_len] = \
+                                new_score[batch_idx, :q_len_local, :]
                 else:
                     # ratio=128: recompute by position with expanded seqlen
                     tp_size = 1
@@ -257,4 +261,4 @@ def _g2_kv_store_or_expand(
     result_idxk = torch.cat(new_idxk, dim=0) if new_idxk else (indexer_k if has_idxk else None)
 
     return (result_kv, result_cmp, result_idxk,
-            compress_topk_idxs, packed_seq_params)
+            compress_topk_idxs, packed_seq_params, compress_topk_score)

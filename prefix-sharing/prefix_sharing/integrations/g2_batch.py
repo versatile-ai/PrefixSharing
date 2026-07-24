@@ -132,11 +132,18 @@ def _run_with_context(original_forward_step, state, model,
 
 
 def _restore_prefix_last(output, plan, layout):
-    """Restore prefix-last logprobs using existing 2D restore logic."""
-    from prefix_sharing.integrations.verl_mcore import (
-        restore_reuser_prefix_columns_2d)
+    """Restore prefix-last logprobs — standalone pretrain adapter.
 
+    NOTE: ``restore_reuser_prefix_columns_2d`` expects verl-format output dict
+    with ``log_probs``/``entropy`` keys and callable vocab-logprob functions.
+    Standalone pretrain outputs ``(output_tensor, loss_func)``.
+    This adapter will be completed when the full standalone training loop
+    is integrated (8-card E2E test phase).
+    """
     if not plan.prefix_last_restore:
         return output
-
-    return restore_reuser_prefix_columns_2d(output, plan, layout)
+    # TODO: implement standalone restore counterpart
+    # - reconstruct per-token logprobs from packed output_tensor
+    # - bulk-copy interior prefix columns
+    # - recompute prefix-last using saved provider logits + reuser label
+    return output

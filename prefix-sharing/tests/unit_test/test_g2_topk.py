@@ -160,7 +160,8 @@ def test_cu_seqlens_adjust_in_expand():
     psp = MockPsp(cu_seqlens_kv=[0, 256, 384])
     topk = torch.zeros(2, 256, 3, dtype=torch.int64)
 
-    _, _, _, _, result_psp = _g2_kv_store_or_expand(
+    result = _g2_kv_store_or_expand(
         ctx, kv, None, None, topk, psp, 128, Mock128Module(), 0, False, False)
+    result_psp = result[4]  # packed_seq_params
 
     assert result_psp.cu_seqlens_kv == [0, 256, 640]
