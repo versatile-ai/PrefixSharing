@@ -94,6 +94,11 @@ def _g2_kv_store_or_expand(
     start_pos: int,
     kv_allgather: bool,
     sequence_parallel: bool,
+    *,
+    query_index=None,       # ratio=4: q_r from Phase 2
+    indexer_weights=None,   # ratio=4: w_r from Phase 2
+    dsa_hidden=None,        # ratio=4: dsa_hidden from Phase 2
+    attention_mask=None,    # ratio=4: forward_with_scores_compress mask
 ):
     """Provider store / Reuser expand for all key-side data.
 
@@ -195,16 +200,16 @@ def _g2_kv_store_or_expand(
             if compress_topk_idxs is not None and compress_ratio > 1:
                 if hasattr(attention_module, 'indexer') and attention_module.indexer is not None:
                     # ratio=4: re-score with expanded indexer_k
-                    if expanded_idxk is not None:
-                        q = ...  # q_r from Phase 2 — needs caller to pass it in
-                        w = ...  # w_r from Phase 2
-                        x = ...  # dsa_hidden from Phase 2
-                        # TODO: wire q_r, w_r, x from patched_forward caller
-                        compress_topk_idxs[batch_idx] = attention_module.indexer.forward_with_scores_compress(
-                            x=x, q=q, k=expanded_idxk, w=w,
-                            mask=None, packed_seq_params=packed_seq_params,
+                    if expanded_idxk is not None and query_index is not None:
+                        new_topk, _ = attention_module.indexer.forward_with_scores_compress(
+                            x=dsa_hidden, q=query_index, k=expanded_idxk, w=indexer_weights,
+                            mask=attention_mask, packed_seq_params=packed_seq_params,
                             start_pos=start_pos, index_topk=attention_module.indexer.index_topk,
-                            offset=0, compress_ratio=compress_ratio)[0][batch_idx:batch_idx+1]
+                            offset=0, compress_ratio=compress_ratio)
+                        q_len_local = valid_len
+                        topk_len = new_topk.shape[-1]
+                        compress_topk_idxs[batch_idx, :q_len_local, :topk_len] = \
+                            new_topk[batch_idx, :q_len_local, :]
                 else:
                     # ratio=128: recompute by position with expanded seqlen
                     tp_size = 1

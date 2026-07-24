@@ -72,4 +72,12 @@ COMPAT_MATRIX: list[CompatEntry] = [
         notes="DeepSeek V4 Flash standalone pretrain; "
               "megatron-core 0.16.1 + mindspeed 0.16.0 + mindspeed_llm 26.0.0.dev",
     ),
+    CompatEntry(
+        verl=None,
+        megatron_core="0.16.2",
+        mindspeed="0.16.0",
+        patch_set_id="mindspeed_deepseek4",
+        notes="DeepSeek V4 Flash standalone pretrain; "
+              "megatron-core 0.16.2 (容器实际版本) + mindspeed 0.16.0",
+    ),
 ]

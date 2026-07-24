@@ -149,7 +149,11 @@ def patch_g2_attention(original_forward):
                 ctx, kv, kv_compress, indexer_k,
                 compress_topk_idxs, packed_seq_params,
                 self.compress_ratio, self, start_pos,
-                self.kv_allgather, self.config.sequence_parallel))
+                self.kv_allgather, self.config.sequence_parallel,
+                query_index=query_index,
+                indexer_weights=weights,
+                dsa_hidden=dsa_hidden_states,
+                attention_mask=attention_mask))
         # ═════════════════════════════════════════════
 
         # ── Phase 4-5: copied orchestration ──

@@ -104,8 +104,6 @@ class Mock4Indexer:
                                       start_pos=0, index_topk=512, offset=0, compress_ratio=4):
         Captured4.append(dict(k_shape=k.shape))
         K = k.shape[0]; topk = min(index_topk, K)
-        # Return [topk_idx, topk_score] with matching batch dim
-        bsz = compress_topk_idxs_batch if hasattr(self, '_bsz_ref') else 1
         S = q.shape[0] if hasattr(q, 'shape') else 1
         return (torch.zeros(2, S, topk, dtype=torch.int64),
                 torch.rand(2, S, topk))
@@ -117,7 +115,6 @@ class Mock4Module:
     def __init__(self): self.compress_ratio = 4; self.layer_number = 1; self.window_size = None; self.indexer = Mock4Indexer()
 
 
-@pytest.mark.skip(reason="ratio=4 path needs q_r/w_r/x from patched_forward (Task 4)")
 def test_ratio4_expanded_k_passed():
     """Ratio=4: expanded indexer_k passed to forward_with_scores_compress."""
     from prefix_sharing.backends.packed_layout import PackedBatchLayout
@@ -132,7 +129,11 @@ def test_ratio4_expanded_k_passed():
     idxk = torch.cat([p_idxk, torch.randn(1, 1, 128)], dim=0)
     topk = torch.zeros(2, 8, 512, dtype=torch.int64)
 
-    _g2_kv_store_or_expand(ctx, kv, None, idxk, topk, None, 4, Mock4Module(), 0, False, False)
+    mock_q = torch.randn(4, 64, 128)  # S=4, n_heads=64, head_dim=128
+    mock_w = torch.randn(4, 64)
+    mock_x = torch.randn(4, 1, 4096)
+    _g2_kv_store_or_expand(ctx, kv, None, idxk, topk, None, 4, Mock4Module(), 0, False, False,
+                           query_index=mock_q, indexer_weights=mock_w, dsa_hidden=mock_x)
 
     # forward_with_scores_compress should be called with expanded k
     assert len(Captured4) >= 1
