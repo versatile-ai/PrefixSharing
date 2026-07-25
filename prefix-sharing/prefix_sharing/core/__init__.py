@@ -17,7 +17,12 @@ from prefix_sharing.core.prefix_store import (
     StoredDeltanetState,
     StoredG2Activation,
 )
-from prefix_sharing.core.planner import PrefixLastRestoreSpec, PrefixSharingPlan, PrefixSharingPlanner
+from prefix_sharing.core.planner import (
+    PrefixLastRestoreSpec,
+    PrefixSharingPlan,
+    PrefixSharingPlanner,
+    align_prefix_lens_to_compression,
+)
 
 __all__ = [
     "G2AttentionStore",
@@ -37,6 +42,7 @@ __all__ = [
     "PrefixSharingPlan",
     "PrefixSharingPlanner",
     "PrefixSharingStats",
+    "align_prefix_lens_to_compression",
     "StoredAttentionKV",
     "StoredDeltanetState",
     "StoredG2Activation",

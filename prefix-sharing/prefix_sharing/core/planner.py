@@ -182,6 +182,33 @@ class PrefixSharingPlan:
 _forward_ids = itertools.count(1)
 
 
+def align_prefix_lens_to_compression(plan: PrefixSharingPlan, compress_ratios: list[int]) -> None:
+    """Align prefix_lens to compress_ratio boundaries.
+
+    For DeepSeek V4 (and models with compressed KV), the prefix sharing
+    fork point must not fall inside a compression block.  This rounds
+    each reuser's prefix_len down to the nearest multiple of the
+    maximum *compress_ratio* across all layers.
+
+    Only has effect when ``compress_ratios`` contains values > 1.
+    Other model types are not affected.
+
+    Must be called after ``plan.plan()`` and before ``trim_batch()``.
+    """
+    max_ratio = max(compress_ratios) if compress_ratios else 1
+    if max_ratio <= 1:
+        return
+
+    aligned = []
+    for i, P in enumerate(plan.prefix_lens):
+        if P > 0 and P % max_ratio != 0:
+            aligned.append((P // max_ratio) * max_ratio)
+        else:
+            aligned.append(P)
+
+    object.__setattr__(plan, "prefix_lens", aligned)
+
+
 def _cumsum(lengths: Sequence[int]) -> list[int]:
     values = [0]
     total = 0

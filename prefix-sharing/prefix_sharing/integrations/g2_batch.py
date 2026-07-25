@@ -10,7 +10,10 @@ from functools import partial
 from typing import Any
 
 from prefix_sharing.core.config import PrefixSharingConfig
-from prefix_sharing.core.planner import PrefixSharingPlanner
+from prefix_sharing.core.planner import (
+    PrefixSharingPlanner,
+    align_prefix_lens_to_compression,
+)
 from prefix_sharing.core.batch_trim import trim_batch
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context
@@ -76,12 +79,23 @@ def wrap_forward_step(
         if not plan.has_sharing:
             return original_forward_step(data_iterator, model)
 
-        # 3. Trim batch (reuser → suffix-only)
+        # 3. Align prefix_lens to compress_ratio (DeepSeek V4 only)
+        try:
+            from megatron.training import get_args
+            compress_ratios = getattr(get_args(), "compress_ratios", None)
+            if compress_ratios:
+                align_prefix_lens_to_compression(plan, compress_ratios)
+                if not plan.has_sharing:  # alignment may have zeroed all prefix_lens
+                    return original_forward_step(data_iterator, model)
+        except (ImportError, RuntimeError):
+            pass
+
+        # 4. Trim batch (reuser → suffix-only)
         trimmed = trim_batch(
             tokens, labels, loss_mask, attention_mask, position_ids, plan)
         trimmed_tokens, trimmed_labels, trimmed_loss_mask, trimmed_attn_mask, trimmed_pos = trimmed
 
-        # 4. Build layout and runtime state
+        # 5. Build layout and runtime state
         layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
         state = _build_runtime_state(plan, layout)
 
