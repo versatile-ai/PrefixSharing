@@ -100,6 +100,7 @@ def patch_g2_attention(original_forward):
 
         # Phase 2: compress_topk_idxs
         compress_topk_idxs = None
+        compress_topk_score = None
         key_index = None
         query_index = None
         weights = None
