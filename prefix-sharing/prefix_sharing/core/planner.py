@@ -190,6 +190,9 @@ def align_prefix_lens_to_compression(plan: PrefixSharingPlan, compress_ratios: l
     each reuser's prefix_len down to the nearest multiple of the
     maximum *compress_ratio* across all layers.
 
+    Rebuilds all derived fields (*kept_lengths_q*, *input_keep_ranges*,
+    *cu_seqlens_q*, etc.) so that trim and layout remain consistent.
+
     Only has effect when ``compress_ratios`` contains values > 1.
     Other model types are not affected.
 
@@ -199,14 +202,43 @@ def align_prefix_lens_to_compression(plan: PrefixSharingPlan, compress_ratios: l
     if max_ratio <= 1:
         return
 
-    aligned = []
-    for i, P in enumerate(plan.prefix_lens):
+    new_prefix_lens = []
+    for P in plan.prefix_lens:
         if P > 0 and P % max_ratio != 0:
-            aligned.append((P // max_ratio) * max_ratio)
+            new_prefix_lens.append((P // max_ratio) * max_ratio)
         else:
-            aligned.append(P)
+            new_prefix_lens.append(P)
 
-    object.__setattr__(plan, "prefix_lens", aligned)
+    if new_prefix_lens == plan.prefix_lens:
+        return  # no changes needed
+
+    # Rebuild derived fields
+    new_kept: list[int] = []
+    new_input_ranges: list[tuple[int, int]] = []
+    new_q_offsets: list[int] = []
+
+    for i, orig_len in enumerate(plan.original_lengths):
+        P = new_prefix_lens[i]
+        is_reuser = plan.provider_index[i] != i and P > 0
+        if is_reuser:
+            kept_len = orig_len - P
+            keep_range = (P, orig_len)
+            q_offset = P
+        else:
+            kept_len = orig_len
+            keep_range = (0, orig_len)
+            q_offset = 0
+        new_kept.append(kept_len)
+        new_input_ranges.append(keep_range)
+        new_q_offsets.append(q_offset)
+
+    object.__setattr__(plan, "prefix_lens", new_prefix_lens)
+    object.__setattr__(plan, "kept_lengths_q", new_kept)
+    object.__setattr__(plan, "cu_seqlens_q", _cumsum(new_kept))
+    object.__setattr__(plan, "input_keep_ranges", new_input_ranges)
+    object.__setattr__(plan, "label_keep_ranges", list(new_input_ranges))
+    object.__setattr__(plan, "loss_mask_keep_ranges", list(new_input_ranges))
+    object.__setattr__(plan, "q_position_offsets", new_q_offsets)
 
 
 def _cumsum(lengths: Sequence[int]) -> list[int]:

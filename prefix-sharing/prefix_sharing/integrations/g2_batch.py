@@ -14,7 +14,12 @@ from prefix_sharing.core.planner import (
     PrefixSharingPlanner,
     align_prefix_lens_to_compression,
 )
-from prefix_sharing.core.batch_trim import trim_batch
+from prefix_sharing.core.batch_trim import (
+    trim_batch,
+    trim_inputs,
+    trim_labels,
+    trim_loss_masks,
+)
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.integrations.context import prefix_sharing_runtime_context
 from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
@@ -91,19 +96,36 @@ def wrap_forward_step(
             pass
 
         # 4. Trim batch (reuser → suffix-only)
-        trimmed = trim_batch(
-            tokens, labels, loss_mask, attention_mask, position_ids, plan)
-        trimmed_tokens, trimmed_labels, trimmed_loss_mask, trimmed_attn_mask, trimmed_pos = trimmed
+        # Use per-field trim helpers matching the plan's keep ranges
+        tokens_2d = tokens.tolist() if hasattr(tokens, 'tolist') else tokens
+        labels_2d = labels.tolist() if hasattr(labels, 'tolist') else labels
+        loss_mask_2d = loss_mask.tolist() if hasattr(loss_mask, 'tolist') else loss_mask
+        attn_2d = attention_mask.tolist() if hasattr(attention_mask, 'tolist') else attention_mask
+        pos_2d = position_ids.tolist() if hasattr(position_ids, 'tolist') else position_ids
+
+        trimmed_tokens = trim_inputs(tokens_2d, plan)
+        trimmed_labels = trim_labels(labels_2d, plan)
+        trimmed_loss_mask = trim_loss_masks(loss_mask_2d, plan)
+        trimmed_attn = trim_batch(attn_2d, plan.input_keep_ranges)
+        trimmed_pos = trim_batch(pos_2d, plan.input_keep_ranges)
+
+        # Pack to flat tensors for Megatron model forward
+        import torch
+        flat_tokens = torch.tensor(trimmed_tokens.flattened, device=tokens.device, dtype=tokens.dtype)
+        flat_labels = torch.tensor(trimmed_labels.flattened, device=labels.device, dtype=labels.dtype)
+        flat_loss_mask = torch.tensor(trimmed_loss_mask.flattened, device=loss_mask.device, dtype=loss_mask.dtype)
+        flat_attn = torch.tensor(trimmed_attn.flattened, device=attention_mask.device, dtype=attention_mask.dtype)
+        flat_pos = torch.tensor(trimmed_pos.flattened, device=position_ids.device, dtype=position_ids.dtype)
 
         # 5. Build layout and runtime state
         layout = PackedBatchLayout.from_valid_lengths(plan.kept_lengths_q)
         state = _build_runtime_state(plan, layout)
 
-        # 5. Build trimmed batch and run forward
+        # 6. Build trimmed batch and run forward
         output = _run_with_context(
             original_forward_step, state, model,
-            trimmed_tokens, trimmed_labels, trimmed_loss_mask,
-            trimmed_attn_mask, trimmed_pos, data_iterator)
+            flat_tokens, flat_labels, flat_loss_mask,
+            flat_attn, flat_pos, data_iterator)
 
         # 6. Restore prefix-last logprobs
         output = _restore_prefix_last(output, plan, layout)
