@@ -41,6 +41,10 @@ def patch_g2_attention(original_forward):
                 rotary_pos_cos=rotary_pos_cos, rotary_pos_sin=rotary_pos_sin,
                 sequence_len_offset=sequence_len_offset)
 
+        # ── Optional: intermediate tensor capture for precision tests ──
+        _capture = getattr(ctx, 'capture_intermediates', False)
+        _cap: dict = {}
+
         # ── Phase 1-3: copied orchestration (no logic changes) ──
         import torch
         import torch_npu
@@ -74,6 +78,9 @@ def patch_g2_attention(original_forward):
         q_compressed = self.linear_q(hidden_states)
         kv_compressed = self.linear_kv(hidden_states)
 
+        if _capture:
+            _cap['linear_q_output'] = q_compressed.detach()  # check 5
+
         q_compressed = self.q_layernorm(q_compressed)
         q, _ = self.linear_q_up_proj(q_compressed)
         q = q.view(q_len, bsz, self.n_local_heads, -1)
@@ -88,8 +95,15 @@ def patch_g2_attention(original_forward):
         q = q.transpose(0, 1)
         global_freqs_cis = self.get_freqs_cis(start_pos, local_seq_len=q_len_local, get_global=True)
         local_freqs_cis = self.get_freqs_cis(start_pos, local_seq_len=q_len_local, get_global=False)
+
+        if _capture:
+            _cap['q_before_rope'] = q.detach()  # check 6
+
         q[..., -self.rope_head_dim:] = apply_rotary_emb(q[..., -self.rope_head_dim:], global_freqs_cis)
         q = q.transpose(0, 1)
+
+        if _capture:
+            _cap['q_after_rope'] = q.detach()  # check 7
 
         kv = self.kv_layernorm(kv_compressed)
         kv = kv.transpose(0, 1)
@@ -97,6 +111,9 @@ def patch_g2_attention(original_forward):
         kv = kv.transpose(0, 1)
         if self.config.sequence_parallel or self.kv_allgather:
             kv = gather_from_sp_cp(kv)
+
+        if _capture:
+            _cap['kv_after_gather'] = kv.detach()  # check 8
 
         # Phase 2: compress_topk_idxs
         compress_topk_idxs = None
@@ -134,6 +151,9 @@ def patch_g2_attention(original_forward):
                     self.compress_ratio, bsz, q_len_global, start_pos, offset,
                     self.kv_allgather)
 
+        if _capture and compress_topk_idxs is not None:
+            _cap['compress_topk_idxs_before_hook'] = compress_topk_idxs.detach()  # check 10
+
         # Phase 3: Compressed KV
         kv_compress = None
         if self.compress_ratio > 1:
@@ -142,6 +162,9 @@ def patch_g2_attention(original_forward):
             if kv_compress is not None:
                 if self.config.sequence_parallel or self.kv_allgather:
                     kv_compress = gather_from_sp_cp(kv_compress)
+
+        if _capture and kv_compress is not None:
+            _cap['kv_compress_before_hook'] = kv_compress.detach()  # check 9
 
         # ═══════════ Hook: Store / Expand ═══════════
         indexer_k = key_index if self.indexer is not None else None
@@ -158,6 +181,11 @@ def patch_g2_attention(original_forward):
                 attention_mask=attention_mask,
                 compress_topk_score=compress_topk_score))
         # ═════════════════════════════════════════════
+
+        if _capture:
+            _cap['kv_after_hook'] = kv.detach()
+            _cap['kv_compress_after_hook'] = kv_compress.detach() if kv_compress is not None else None
+            _cap['compress_topk_idxs_after_hook'] = compress_topk_idxs.detach() if compress_topk_idxs is not None else None
 
         # ── Phase 4-5: copied orchestration ──
         self.attn_sink = self.attn_sink.to(hidden_states.device)
@@ -206,11 +234,30 @@ def patch_g2_attention(original_forward):
                     avg_group=parallel_state.get_tensor_and_context_parallel_group())
                 o = DSAIndexerLossAutoScaler.apply(o, loss)
 
+        # TND layout (packed) may return 3D [T_total, H, D] or 4D
+        # [T_total, 1, H, D] where seq and batch are merged into dim 0.
+        # PA_ND returns 4D [T, B, H, D].  Normalise: recover (q_len, bsz).
+        if o.ndim == 3:
+            # 3D: [T_total, H, D] — recover batch from q_len/bsz
+            if o.shape[0] != q_len and o.shape[0] % q_len == 0:
+                o = o.reshape(q_len, bsz, *o.shape[1:])
+            else:
+                o = o.unsqueeze(1)
+        elif o.ndim == 4 and o.shape[1] == 1 and o.shape[0] != q_len and o.shape[0] % q_len == 0:
+            # 4D: [T_total, 1, H, D] — batch merged into seq dim 0
+            o = o.reshape(q_len, bsz, *o.shape[2:])
+
+        if _capture:
+            _cap['attention_output_raw'] = o.detach()  # check 12
+
         o = o.transpose(0, 1)
         o_rotated = o.clone()
         o_rotated[..., -self.rope_head_dim:] = apply_rotary_emb(
             o[..., -self.rope_head_dim:], global_freqs_cis, True)
         o = o_rotated.transpose(0, 1)
+
+        if _capture:
+            _cap['attention_output_rotated'] = o.detach()  # check 14
 
         o = rearrange(o, 's b (g h) d -> s b g (h d)',
                       s=q_len, b=bsz, g=self.n_groups // self.world_size,
@@ -222,6 +269,12 @@ def patch_g2_attention(original_forward):
             l=self.o_lora_rank, h=self.n_heads, g=self.n_local_groups)
         o = torch.einsum("sbgd,gld->sbgl", o, weight_woa)
         core_attn_out, bias = self.linear_o_up_proj(o.flatten(2))
+
+        if _capture:
+            _cap['core_attn_out'] = core_attn_out.detach()  # check 15
+            _cap['bias'] = bias.detach() if bias is not None else None  # check 16
+            ctx._captured_intermediates = _cap
+
         return core_attn_out, bias
 
     return patched_forward

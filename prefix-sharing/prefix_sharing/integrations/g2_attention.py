@@ -116,6 +116,11 @@ def _g2_kv_store_or_expand(
     tp_rank = ctx.parallel_info.tp_rank
     layer_id = attention_module.layer_number if attention_module is not None else 0
 
+    # Empty batch (all sequences trimmed away) → return empty tensors unchanged.
+    if layout.batch_size == 0:
+        return (kv, kv_compress, indexer_k,
+                compress_topk_idxs, packed_seq_params, compress_topk_score)
+
     # Split raw KV by padded lengths (matching Q path)
     kv_rows = _split_by_cu_seqlens(kv, layout.padded_lengths)
 
@@ -161,9 +166,10 @@ def _g2_kv_store_or_expand(
         elif plan.is_reuser(batch_idx):
             # ── Reuser: expand ──
             prefix_len = plan.prefix_lens[batch_idx]
-            assert prefix_len % compress_ratio == 0, (
-                f"Phase 1 requires aligned prefix: "
-                f"prefix_len={prefix_len}, compress_ratio={compress_ratio}")
+            if compress_ratio > 1:
+                assert prefix_len % compress_ratio == 0, (
+                    f"Phase 1 requires aligned prefix: "
+                    f"prefix_len={prefix_len}, compress_ratio={compress_ratio}")
 
             provider_idx = plan.provider_index[batch_idx]
             slot_id = PrefixActivationSlotId(
@@ -197,6 +203,9 @@ def _g2_kv_store_or_expand(
                     idxk_rows[batch_idx][:idxk_s]], dim=0)
                 new_idxk.append(expanded_idxk)
 
+            # THD format (bsz=1): map batch_idx to tensor batch dim 0
+            _topk_batch_idx = 0 if compress_topk_idxs is not None and compress_topk_idxs.shape[0] == 1 else batch_idx
+
             # Recompute topk for expanded key space
             if compress_topk_idxs is not None and compress_ratio > 1:
                 if hasattr(attention_module, 'indexer') and attention_module.indexer is not None:
@@ -209,11 +218,11 @@ def _g2_kv_store_or_expand(
                             offset=0, compress_ratio=compress_ratio)
                         q_len_local = valid_len
                         topk_len = new_topk.shape[-1]
-                        compress_topk_idxs[batch_idx, :q_len_local, :topk_len] = \
-                            new_topk[batch_idx, :q_len_local, :]
+                        compress_topk_idxs[_topk_batch_idx, :q_len_local, :topk_len] = \
+                            new_topk[_topk_batch_idx, :q_len_local, :]
                         if compress_topk_score is not None:
-                            compress_topk_score[batch_idx, :q_len_local, :topk_len] = \
-                                new_score[batch_idx, :q_len_local, :]
+                            compress_topk_score[_topk_batch_idx, :q_len_local, :topk_len] = \
+                                new_score[_topk_batch_idx, :q_len_local, :]
                 else:
                     # ratio=128: recompute by position with expanded seqlen
                     tp_size = 1
@@ -232,8 +241,15 @@ def _g2_kv_store_or_expand(
                     new_idxs = attention_module.get_compress_topk_idxs(
                         compress_ratio, bsz, expanded_seqlen,
                         start_pos=start_pos, offset=0, cp_shard=kv_allgather)
-                    compress_topk_idxs[batch_idx, :q_len_local, :] = \
-                        new_idxs[batch_idx, -q_len_local:, :]
+                    topk_len = min(new_idxs.shape[-1],
+                                   compress_topk_idxs.shape[-1])
+                    # get_compress_topk_idxs returns LOCAL indices [0, seqlen//r).
+                    # Add provider's CMP block offset to convert to global packed indices.
+                    # Provider CMP blocks before this reuser = global offset
+                    _cmp_offset = sum(cmp_lengths[:batch_idx]) if cmp_rows else 0
+                    _new_idxs = new_idxs[_topk_batch_idx, -q_len_local:, :topk_len].clone()
+                    _new_idxs[_new_idxs >= 0] += _cmp_offset
+                    compress_topk_idxs[_topk_batch_idx, :q_len_local, :topk_len] = _new_idxs
 
             # Store back for transitive reuse
             own_slot = PrefixActivationSlotId(

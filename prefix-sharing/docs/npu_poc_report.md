@@ -1,7 +1,7 @@
 # DeepSeek V4 NPU 可行性验证报告
 
-> **日期**：2026-07-22（更新 2026-07-23，sparse_flash_mla 安装成功）
-> **环境**：NPU 单卡（1×910B3, 64GB HBM），容器 `verl-qwen-prefix-baseline` → 后续切至 `ps-build-910`（192.168.0.2）
+> **日期**：2026-07-22（更新 2026-07-29，CANN 9.1 sparse_flash_mla 验证通过）
+> **环境**：NPU 单卡（1×910B3, 64GB HBM），容器 `verl-qwen-prefix-baseline` → `ps-build-910`（192.168.0.2）→ `deepseek-verify`（192.168.0.2, CANN 9.1）
 > **目的**：验证 `DeepSeek4SelfAttention` 能否脱离完整模型独立导入、实例化、执行 forward
 
 ## 1. 环境信息
@@ -548,3 +548,79 @@ import cann_ops_transformer
                  └─ 触发 AscendC kernel JIT 编译（CANN 9.0.0 编译器）
                       └─ NPU 执行
 ```
+
+## 9. CANN 9.1 最终验证（2026-07-29）
+
+### 9.1 环境
+
+| 项目 | 值 |
+|------|-----|
+| **服务器** | `192.168.0.2` |
+| **容器** | `deepseek-verify` |
+| **镜像** | `deepseek-rl:910b-cann9.1-vllm0.23-v23-sparse`（21GB tar 加载） |
+| **CANN** | `9.1.0-beta.3` |
+| **PyTorch** | 2.10.0 |
+| **torch_npu** | 2.10.0.post2 |
+
+### 9.2 镜像预装确认
+
+镜像已内置完整 sparse_flash_mla 算子栈，无需编译：
+
+| 组件 | 位置 | 状态 |
+|------|------|:--:|
+| `aclnnSparseFlashMla`（前向） | CANN 9.1.0 内置 | ✅ |
+| `aclnnSparseFlashMlaMetadata` | `libcust_opapi.so`（ops-transformer 9715a522 编译） | ✅ |
+| `aclnnSparseFlashMlaGrad`（反向） | ops-transformer 9715a522 编译 | ✅ |
+| `aclnnSparseFlashMlaGradMetadata` | ops-transformer 9715a522 编译 | ✅ |
+| `npu_ops_transformer`（Python） | pip list 可见（1.0.0） | ✅ |
+| C++ wrapper (`.so`) | `/root/.cache/torch_extensions/` 预编译 | ✅ |
+| `binary_info_config.json` | CANN 9.1 内置含 SparseFlashMla | ✅ |
+
+### 9.3 关键环境变量
+
+```bash
+export ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/vendors/custom_transformer
+```
+
+**不设这个变量就会报 `aclInit error 507008`**——这是此前在 CANN 9.1 上反复失败的根因。镜像里算子已经预编译好了，不是固件问题。
+
+### 9.4 验证通过
+
+```python
+import torch, os
+import cann_ops_transformer.ops as ops
+os.environ['ASCEND_CUSTOM_OPP_PATH'] = '/usr/local/Ascend/vendors/custom_transformer'
+
+B, S, r = 1, 128, 128
+D = 512
+q   = torch.randn(B, S, 1, D, device='npu', dtype=torch.float16)
+ori = torch.randn(B, S, 1, D, device='npu', dtype=torch.float16)
+cmp = torch.randn(B, S//r, 1, D, device='npu', dtype=torch.float16)
+cr  = torch.tensor([0], dtype=torch.int32, device='npu')
+sinks = torch.zeros(B, device='npu', dtype=torch.float32)
+
+m = ops.sparse_flash_mla_metadata(
+    num_heads_q=1, num_heads_kv=1, head_dim=D,
+    cmp_residual_kv=cr, batch_size=B,
+    max_seqlen_q=S, max_seqlen_ori_kv=S, max_seqlen_cmp_kv=S//r,
+    cmp_topk=0, cmp_ratio=r,
+    ori_mask_mode=4, cmp_mask_mode=3,
+    ori_win_left=127, ori_win_right=0,
+    layout_q='BSND', layout_kv='BSND',
+    has_ori_kv=True, has_cmp_kv=True)
+
+out = ops.sparse_flash_mla(q, ori_kv=ori, cmp_kv=cmp,
+    cmp_residual_kv=cr, sinks=sinks, metadata=m, cmp_ratio=r,
+    layout_q='BSND', layout_kv='BSND')
+
+print('SUCCESS! attn_out:', out[0].shape)
+# → torch.Size([1, 128, 1, 512])
+```
+
+### 9.5 经验教训
+
+1. **用对镜像**：CANN 9.1 镜像 `deepseek-rl:910b-cann9.1-vllm0.23-v23-sparse` 算子已预编译，不需要从 ops-transformer 源码编译
+2. **设对环境变量**：`ASCEND_CUSTOM_OPP_PATH` 必须指向 vendor 目录，否则 `aclInit` 失败
+3. **用对函数名**：CANN 9.1 的 `npu_ops_transformer` 导出原始接口 `sparse_flash_mla` + `sparse_flash_mla_metadata`（不是 `npu_sparse_flash_mla`）
+4. **不需要 `cann_ops_transformer` 桥接**：`import cann_ops_transformer.ops as ops` 直接可用，镜像已内置
+5. **`aclInit error 507008` 不一定是固件问题**：先检查 `ASCEND_CUSTOM_OPP_PATH` 是否设对

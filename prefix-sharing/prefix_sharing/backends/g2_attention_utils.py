@@ -125,13 +125,17 @@ def _adjust_cu_seqlens_for_batch(
     if packed_seq_params is None:
         return None
 
+    import torch
+
     # cu_seqlens_kv_padded takes priority (MindSpeed >= 2.x may define both).
-    kv_attr = (
-        "cu_seqlens_kv_padded"
-        if hasattr(packed_seq_params, "cu_seqlens_kv_padded")
-        else "cu_seqlens_kv"
-    )
-    old_cu_kv: list[int] = list(getattr(packed_seq_params, kv_attr))
+    _has_padded = (hasattr(packed_seq_params, "cu_seqlens_kv_padded")
+                   and getattr(packed_seq_params, "cu_seqlens_kv_padded") is not None)
+    kv_attr = "cu_seqlens_kv_padded" if _has_padded else "cu_seqlens_kv"
+    old_cu_kv_raw = getattr(packed_seq_params, kv_attr)
+    if old_cu_kv_raw is None:
+        return packed_seq_params  # nothing to adjust
+    _kv_is_tensor = isinstance(old_cu_kv_raw, torch.Tensor)
+    old_cu_kv: list[int] = list(old_cu_kv_raw)
 
     for batch_idx in range(plan.batch_size):
         if not plan.is_reuser(batch_idx):
@@ -140,16 +144,22 @@ def _adjust_cu_seqlens_for_batch(
         for i in range(batch_idx + 1, len(old_cu_kv)):
             old_cu_kv[i] += offset
 
-    new_params = replace(packed_seq_params, **{kv_attr: old_cu_kv})
+    new_params = replace(packed_seq_params, **{kv_attr:
+        torch.tensor(old_cu_kv, dtype=old_cu_kv_raw.dtype, device=old_cu_kv_raw.device)
+        if _kv_is_tensor else old_cu_kv})
 
     # cu_seqlens_cmp_kv — same logic with compress_ratio division.
     if hasattr(packed_seq_params, "cu_seqlens_cmp_kv") and packed_seq_params.cu_seqlens_cmp_kv is not None:
-        old_cu_cmp: list[int] = list(packed_seq_params.cu_seqlens_cmp_kv)
+        old_cu_cmp_raw = packed_seq_params.cu_seqlens_cmp_kv
+        _cmp_is_tensor = isinstance(old_cu_cmp_raw, torch.Tensor)
+        old_cu_cmp: list[int] = list(old_cu_cmp_raw)
         for batch_idx in range(plan.batch_size):
             if plan.is_reuser(batch_idx):
                 cmp_offset = plan.prefix_lens[batch_idx] // compress_ratio
                 for i in range(batch_idx + 1, len(old_cu_cmp)):
                     old_cu_cmp[i] += cmp_offset
-        new_params = replace(new_params, cu_seqlens_cmp_kv=old_cu_cmp)
+        new_params = replace(new_params, cu_seqlens_cmp_kv=
+            torch.tensor(old_cu_cmp, dtype=old_cu_cmp_raw.dtype, device=old_cu_cmp_raw.device)
+            if _cmp_is_tensor else old_cu_cmp)
 
     return new_params
