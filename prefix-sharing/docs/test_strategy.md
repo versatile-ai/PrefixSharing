@@ -1,5 +1,21 @@
 # DeepSeek V4 PrefixSharing 测试策略
 
+> **日期**：2026-07-22（原版），2026-08-03（标记作废）
+> **状态**：⛔ 作废——以下内容基于 v2 重构前的 A-E 功能组结构，已被实际执行替代。
+> 实际测试结果见 `docs/reports/precision_test_report.md`，当前状态见 `project_status.md`。
+
+## 原方案 vs 实际执行
+
+| 原方案 | 实际 |
+|--------|------|
+| A-E 功能组 (B1-B4 细分) | Task 1-5 (v2 重构) |
+| 组 C (ratio=4 DSA Indexer) | 未开始 |
+| 组 D (Transformer 注入) | v2 删除 |
+| 组 E (8卡 E2E) | 替换为 padded 多卡 + packed expand |
+| 26 Mac + 19 NPU + 6 E2E = 51 用例 | 225 Mac + 28 NPU 配置 |
+
+---
+
 > **原则**：TDD 优先，逐层验证。每个功能组完成开发并通过全部验证用例后，再进入下一组。
 
 ## 环境矩阵
