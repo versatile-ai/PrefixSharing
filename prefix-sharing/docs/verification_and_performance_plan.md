@@ -1,35 +1,32 @@
 # PrefixSharing DeepSeek V4 — 验证与性能测试方案
 
-> **日期**：2026-07-26
-> **状态**：方案讨论稿
-> **前置**：Task 1-5 核心功能开发已全部完成（Mac 216 passed, NPU 6/6 passed）
+> **日期**：2026-07-26（方案），2026-08-03（执行完成）
+> **状态**：精度验证已完成，性能测试延后
+> **实际执行**：与方案差异较大，见 §0.3。完整结果见 `docs/reports/precision_test_report.md`
 
 ## 0. 背景与目标
 
 ### 0.1 已完成
 
-核心代码（Store、Hook、Topk、Patch、wrap_forward_step）全部就绪。Mac 单测覆盖了张量操作正确性，NPU 上 ratio=0（无压缩）路径的 patch + forward + store + output parity 已跑通。
+核心代码（Store、Hook、Topk、Patch、wrap_forward_step、**padded 路径**）全部就绪。
 
-### 0.2 待完成
+### 0.2 精度验证已通过（28/28）
 
-以下两项**从未执行过**：
+| 阶段 | 配置数 | 结果 |
+|------|:--:|------|
+| 单卡等价性 (ratio=0/128, packed) | 18 | bitwise |
+| Padded 多卡 (TP=1/2, CP=1/2) | 5 | bitwise / ~1e-4 |
+| Packed expand (单层, THD) | 5 | allclose(1e-3) |
 
-1. **精度验证**：ratio=128/4 的 forward/backward 等价性对比；多卡 TP/CP 正确性；E2E loss/logprob/grad 一致性
-2. **性能测试**：算子级和流程级 PS vs baseline 的耗时/吞吐/内存对比
-
-### 0.3 总路线
+### 0.3 总路线（实际执行 vs 原计划）
 
 ```
-阶段 1：精度验证（功能正确性 + 精度红线）
-├── 1.1  单卡功能补测 (Mac)
-├── 1.2  单卡精度等价性 (NPU 单卡)
-├── 1.3  多卡 TP 精度 (NPU 多卡)
-├── 1.4  多卡 CP 精度 (NPU 多卡)
-└── 1.5  端到端精度红线 (NPU 8 卡)
-
-阶段 2：性能测试
-├── 2.1  算子级基准
-└── 2.2  流程级对比
+原计划                         实际执行
+Task 1-2 (单卡)     ✅ ─── 同计划，18/18 bitwise
+Task 3 (TP)         ⏸️ ─── 单层 TP 需要 Megatron 完整初始化，改在 E2E 阶段
+Task 4 (CP)         ⏸️ ─── 同上
+Task 5 (E2E)        🔀 ─── DeepSeek4Model 构建阻塞(PP配置)，改为 padded 多卡 + packed expand
+阶段 2 (性能)       ⏸️ ─── 延后
 ```
 
 ---

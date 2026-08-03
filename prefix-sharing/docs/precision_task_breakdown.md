@@ -1,8 +1,9 @@
 # Precision Verification — Task Breakdown
 
-> **日期**：2026-07-26
+> **日期**：2026-07-26（方案），2026-08-03（被实际执行替代）
+> **状态**：⛔ 作废——实际执行路径与方案差异较大，见 `docs/reports/precision_test_report.md` 和 `project_status.md`
 > **父文档**：`verification_and_performance_plan.md`
-> **范围**：阶段 1（精度验证）的任务拆分和实现细节
+> **范围**：阶段 1（精度验证）的任务拆分和实现细节（原始方案，仅供历史参考）
 > **平台矩阵**：Mac (CPU PyTorch) → NPU 单卡 → NPU 多卡 (TP/CP) → NPU 8 卡
 
 ## 依赖关系

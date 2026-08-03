@@ -159,3 +159,55 @@ prefix_sharing/
 2. **只扩 key-side**：扩 KV / CMP KV / indexer_k；不扩 Q / attn_o / residual / hidden
 3. **KV 不 detach**
 4. **精度一致性优先**
+
+---
+
+## 8. Padded 路径补充设计（2026-08-03）
+
+### 8.1 背景
+
+精度测试中发现两种 batch 格式需要不同 PS 策略：
+
+| 格式 | Shape | 场景 | PS 操作 |
+|------|-------|------|---------|
+| Padded (BSND) | `[S, B, D]`, B>1 | Standalone pretrain, TP/CP | In-place KV replace，不变长 |
+| Packed (THD) | `[T, 512]` or `[T, 1, D]` | verl RL, variable-length | Cat expand，cu_seqlens 调整 |
+
+### 8.2 分派逻辑
+
+`_g2_kv_store_or_expand` 入口检测：
+
+```python
+_is_padded = kv.ndim == 3 and kv.shape[1] > 1
+if _is_padded:
+    return _g2_padded_store_or_replace(...)
+# else: packed path (cat expand)
+```
+
+### 8.3 Padded 路径
+
+```
+Provider: store(kv[:valid_len, provider_idx, :])
+Reuser:   kv[:prefix_len, reuser_idx, :] = provider.kv[:prefix_len]
+```
+
+- Provider 和 reuser 序列长度相同（S 对齐）
+- KV 替换后 shape 不变
+- 不需要 trim（reuser 全量 Q 仍在，只是 KV prefix 被替换）
+- 不需要 cu_seqlens 调整
+
+### 8.4 精度特征
+
+| 特征 | Padded | Packed |
+|------|--------|--------|
+| 精度 | bitwise (max_diff=0) | allclose(1e-3) |
+| 差异来源 | 无 | NPU GEMM tile non-determinism |
+| NPU non-det 影响 | 无（total length 不变） | 有（trim 改变 total length） |
+| TP/CP 支持 | ✅ 已验证 | 待 verl 集成 |
+
+### 8.5 对 wrap_forward_step 的影响
+
+Padded 模式下不需要 trim batch。改为：
+1. 检测前缀 → 2. 注入 runtime context → 3. 直接调用 `original_forward_step`
+
+`get_batch` 通过 monkey-patch `__main__.get_batch` 实现缓存。

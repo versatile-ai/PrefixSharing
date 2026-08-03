@@ -7,6 +7,8 @@ and reuser expansion.  Framework-agnostic — no MindSpeed dependency.
 
 from __future__ import annotations
 
+import os as _os
+
 import torch
 
 from prefix_sharing.backends.g2_attention_utils import (
@@ -20,6 +22,8 @@ from prefix_sharing.core.prefix_store import (
     PrefixActivationSlotId,
     StoredG2Activation,
 )
+
+_PS_DEBUG = _os.environ.get("PS_DEBUG", "0") == "1"
 
 
 def _g2_store_with_kwargs(store, slot_id, data):
@@ -215,9 +219,6 @@ def _g2_kv_store_or_expand(
     new_cmp: list[torch.Tensor] = []
     new_idxk: list[torch.Tensor] = []
 
-    import os as _os
-    _debug = _os.environ.get("PS_DEBUG", "0") == "1"
-
     for batch_idx in range(layout.batch_size):
         valid_len = layout.valid_lengths[batch_idx]
 
@@ -230,7 +231,7 @@ def _g2_kv_store_or_expand(
             slot_id = PrefixActivationSlotId(
                 plan.forward_id, plan.micro_batch_id, layer_id,
                 batch_idx, PREFIX_STATE_TYPE_G2_ATTENTION, tp_rank)
-            if _debug:
+            if _PS_DEBUG:
                 print(f"[PS_DEBUG] Provider store: batch_idx={batch_idx} valid_len={valid_len} kv_shape={valid_kv.shape} slot={slot_id}")
             _g2_store_with_kwargs(ctx.store, slot_id, StoredG2Activation(
                 kv=valid_kv, kv_compress=valid_cmp, indexer_k=valid_idxk,
@@ -254,18 +255,18 @@ def _g2_kv_store_or_expand(
             slot_id = PrefixActivationSlotId(
                 plan.forward_id, plan.micro_batch_id, layer_id,
                 provider_idx, PREFIX_STATE_TYPE_G2_ATTENTION, tp_rank)
-            if _debug:
+            if _PS_DEBUG:
                 print(f"[PS_DEBUG] Reuser load: batch_idx={batch_idx} prefix_len={prefix_len} provider_idx={provider_idx} slot={slot_id}")
                 print(f"[PS_DEBUG] Store contains slot: {ctx.store.contains(slot_id)}")
             provider = ctx.store.load(slot_id)
-            if _debug:
+            if _PS_DEBUG:
                 print(f"[PS_DEBUG] Loaded provider kv: shape={provider.kv.shape} stored_len={provider.stored_len}")
 
             # Expand kv
             expanded_kv = torch.cat([
                 provider.kv[:prefix_len],
                 kv_rows[batch_idx][:valid_len]], dim=0)
-            if _debug:
+            if _PS_DEBUG:
                 print(f"[PS_DEBUG] Expanded kv: {expanded_kv.shape} (prefix={prefix_len} + suffix={valid_len})")
             new_kv.append(expanded_kv)
 
@@ -355,15 +356,15 @@ def _g2_kv_store_or_expand(
 
     # Adjust cu_seqlens for reusers (offsets all subsequent entries)
     if packed_seq_params is not None:
-        if _debug:
+        if _PS_DEBUG:
             print(f"[PS_DEBUG] Before adjust: cu_seqlens_q={packed_seq_params.cu_seqlens_q}, cu_seqlens_kv={packed_seq_params.cu_seqlens_kv}")
         packed_seq_params = _adjust_cu_seqlens_for_batch(
             packed_seq_params, plan, compress_ratio)
-        if _debug:
+        if _PS_DEBUG:
             print(f"[PS_DEBUG] After adjust: cu_seqlens_q={packed_seq_params.cu_seqlens_q}, cu_seqlens_kv={packed_seq_params.cu_seqlens_kv}")
 
     result_kv = torch.cat(new_kv, dim=0)
-    if _debug:
+    if _PS_DEBUG:
         print(f"[PS_DEBUG] result_kv shape: {result_kv.shape} (was {kv.shape})")
     result_cmp = torch.cat(new_cmp, dim=0) if new_cmp else (kv_compress if has_cmp else None)
     result_idxk = torch.cat(new_idxk, dim=0) if new_idxk else (indexer_k if has_idxk else None)
