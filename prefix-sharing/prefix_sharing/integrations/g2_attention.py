@@ -82,6 +82,69 @@ def _g2_store_per_sequence(ctx, layout, plan, layer_id, tp_rank, field, tensor):
         _g2_store_with_kwargs(ctx.store, slot_id, merged)
 
 
+def _g2_padded_store_or_replace(
+    ctx, kv, kv_compress, indexer_k,
+    compress_topk_idxs, packed_seq_params, compress_topk_score,
+    compress_ratio, attention_module, layout, plan, layer_id, tp_rank,
+):
+    """Store/replace for padded batch [S, B, D] format.
+
+    Unlike the packed path which concatenates variable-length sequences,
+    padded batch keeps all sequences at the same length S. Each sequence
+    is in kv[:, batch_idx, :].
+
+    Provider: store kv[:valid_len, provider_idx, :] into G2AttentionStore.
+    Reuser:   replace kv[:prefix_len, reuser_idx, :] with stored provider KV.
+    Tensors are returned with the same shape — no length change.
+    """
+    seq_len = kv.shape[0]
+
+    for batch_idx in range(layout.batch_size):
+        valid_len = layout.valid_lengths[batch_idx]
+
+        if plan.is_provider[batch_idx]:
+            provider_kv = kv[:valid_len, batch_idx, :].clone()
+            provider_cmp = None
+            if kv_compress is not None and compress_ratio > 1:
+                cmp_len = valid_len // compress_ratio
+                provider_cmp = kv_compress[:cmp_len, batch_idx, :].clone() \
+                    if kv_compress.ndim == 3 else kv_compress[:cmp_len].clone()
+            provider_idxk = None
+            if indexer_k is not None and compress_ratio > 1:
+                idxk_len = valid_len // compress_ratio
+                if indexer_k.ndim >= 3 and indexer_k.shape[1] > 1:
+                    provider_idxk = indexer_k[:idxk_len, batch_idx].clone()
+                else:
+                    provider_idxk = indexer_k[:idxk_len].clone()
+
+            slot_id = PrefixActivationSlotId(
+                plan.forward_id, plan.micro_batch_id, layer_id,
+                batch_idx, PREFIX_STATE_TYPE_G2_ATTENTION, tp_rank)
+            _g2_store_with_kwargs(ctx.store, slot_id, StoredG2Activation(
+                kv=provider_kv, kv_compress=provider_cmp,
+                indexer_k=provider_idxk, stored_len=valid_len))
+
+        elif plan.is_reuser(batch_idx):
+            prefix_len = plan.prefix_lens[batch_idx]
+            provider_idx = plan.provider_index[batch_idx]
+            slot_id = PrefixActivationSlotId(
+                plan.forward_id, plan.micro_batch_id, layer_id,
+                provider_idx, PREFIX_STATE_TYPE_G2_ATTENTION, tp_rank)
+            provider = ctx.store.load(slot_id)
+
+            kv[:prefix_len, batch_idx, :] = provider.kv[:prefix_len]
+
+            if kv_compress is not None and compress_ratio > 1 and provider.kv_compress is not None:
+                cmp_p = prefix_len // compress_ratio
+                if kv_compress.ndim == 3 and kv_compress.shape[1] > 1:
+                    kv_compress[:cmp_p, batch_idx, :] = provider.kv_compress[:cmp_p]
+                else:
+                    kv_compress[:cmp_p] = provider.kv_compress[:cmp_p]
+
+    return (kv, kv_compress, indexer_k,
+            compress_topk_idxs, packed_seq_params, compress_topk_score)
+
+
 def _g2_kv_store_or_expand(
     ctx,
     kv: torch.Tensor,
@@ -121,6 +184,17 @@ def _g2_kv_store_or_expand(
         return (kv, kv_compress, indexer_k,
                 compress_topk_idxs, packed_seq_params, compress_topk_score)
 
+    # Padded batch (BSND): kv is [S, B, D] with B > 1.
+    # Each sequence already has full KV for all positions (no trim).
+    # Store provider prefix KV, then replace reuser prefix KV in-place.
+    # Tensor shape stays [S, B, D] — no length change.
+    _is_padded = kv.ndim == 3 and kv.shape[1] > 1
+    if _is_padded:
+        return _g2_padded_store_or_replace(
+            ctx, kv, kv_compress, indexer_k,
+            compress_topk_idxs, packed_seq_params, compress_topk_score,
+            compress_ratio, attention_module, layout, plan, layer_id, tp_rank)
+
     # Split raw KV by padded lengths (matching Q path)
     kv_rows = _split_by_cu_seqlens(kv, layout.padded_lengths)
 
@@ -141,6 +215,9 @@ def _g2_kv_store_or_expand(
     new_cmp: list[torch.Tensor] = []
     new_idxk: list[torch.Tensor] = []
 
+    import os as _os
+    _debug = _os.environ.get("PS_DEBUG", "0") == "1"
+
     for batch_idx in range(layout.batch_size):
         valid_len = layout.valid_lengths[batch_idx]
 
@@ -153,6 +230,8 @@ def _g2_kv_store_or_expand(
             slot_id = PrefixActivationSlotId(
                 plan.forward_id, plan.micro_batch_id, layer_id,
                 batch_idx, PREFIX_STATE_TYPE_G2_ATTENTION, tp_rank)
+            if _debug:
+                print(f"[PS_DEBUG] Provider store: batch_idx={batch_idx} valid_len={valid_len} kv_shape={valid_kv.shape} slot={slot_id}")
             _g2_store_with_kwargs(ctx.store, slot_id, StoredG2Activation(
                 kv=valid_kv, kv_compress=valid_cmp, indexer_k=valid_idxk,
                 stored_len=valid_len))
@@ -175,12 +254,19 @@ def _g2_kv_store_or_expand(
             slot_id = PrefixActivationSlotId(
                 plan.forward_id, plan.micro_batch_id, layer_id,
                 provider_idx, PREFIX_STATE_TYPE_G2_ATTENTION, tp_rank)
+            if _debug:
+                print(f"[PS_DEBUG] Reuser load: batch_idx={batch_idx} prefix_len={prefix_len} provider_idx={provider_idx} slot={slot_id}")
+                print(f"[PS_DEBUG] Store contains slot: {ctx.store.contains(slot_id)}")
             provider = ctx.store.load(slot_id)
+            if _debug:
+                print(f"[PS_DEBUG] Loaded provider kv: shape={provider.kv.shape} stored_len={provider.stored_len}")
 
             # Expand kv
             expanded_kv = torch.cat([
                 provider.kv[:prefix_len],
                 kv_rows[batch_idx][:valid_len]], dim=0)
+            if _debug:
+                print(f"[PS_DEBUG] Expanded kv: {expanded_kv.shape} (prefix={prefix_len} + suffix={valid_len})")
             new_kv.append(expanded_kv)
 
             # Expand kv_compress
@@ -269,10 +355,16 @@ def _g2_kv_store_or_expand(
 
     # Adjust cu_seqlens for reusers (offsets all subsequent entries)
     if packed_seq_params is not None:
+        if _debug:
+            print(f"[PS_DEBUG] Before adjust: cu_seqlens_q={packed_seq_params.cu_seqlens_q}, cu_seqlens_kv={packed_seq_params.cu_seqlens_kv}")
         packed_seq_params = _adjust_cu_seqlens_for_batch(
             packed_seq_params, plan, compress_ratio)
+        if _debug:
+            print(f"[PS_DEBUG] After adjust: cu_seqlens_q={packed_seq_params.cu_seqlens_q}, cu_seqlens_kv={packed_seq_params.cu_seqlens_kv}")
 
     result_kv = torch.cat(new_kv, dim=0)
+    if _debug:
+        print(f"[PS_DEBUG] result_kv shape: {result_kv.shape} (was {kv.shape})")
     result_cmp = torch.cat(new_cmp, dim=0) if new_cmp else (kv_compress if has_cmp else None)
     result_idxk = torch.cat(new_idxk, dim=0) if new_idxk else (indexer_k if has_idxk else None)
 
