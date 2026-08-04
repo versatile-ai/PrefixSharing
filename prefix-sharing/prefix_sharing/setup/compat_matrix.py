@@ -63,7 +63,17 @@ COMPAT_MATRIX: list[CompatEntry] = [
         notes="纯 Megatron + MindSpeed 训练; 无 verl; "
               "仅 patch Attention.forward",
     ),
-    # 组合三：DeepSeek V4 Flash standalone pretrain (non-verl path)
+    # 组合三：verl 0.8.0 + Megatron Core 0.12.1（DeepSeek V4 CANN 9.1 容器）
+    CompatEntry(
+        verl="0.8.0.dev",
+        megatron_core="0.12.1",
+        mindspeed=None,
+        patch_set_id="mindspeed_deepseek4",
+        notes="verl 0.8.0 + megatron-core 0.12.1; "
+              "DeepSeek V4 Flash container (CANN 9.1, deepseek-rl:910b-cann9.1-vllm0.23-v23-sparse); "
+              "no MindSpeed version detectable",
+    ),
+    # 组合四：DeepSeek V4 Flash standalone pretrain (non-verl path)
     CompatEntry(
         verl=None,
         megatron_core="0.16.1",
