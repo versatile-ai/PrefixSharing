@@ -1,6 +1,6 @@
 # PrefixSharing DeepSeek V4 项目状态
 
-> **日期**：2026-08-03
+> **日期**：2026-08-04
 > **分支**：`feature/deepseek4-prefix-sharing`
 
 ## 1. 项目目标
@@ -56,9 +56,10 @@ prefix_sharing/
 | 单卡等价性 | NPU 单卡, BF16 | 18 | bitwise (max_diff=0) | report_1_2_single_card.md |
 | Padded 多卡训练 | NPU 多卡, TP/CP | 5 | context-only bitwise, KV-replace ~1e-4 | precision_test_report.md §3.2 |
 | Packed Expand | NPU 单卡, BF16 | 5 | allclose(1e-3~2e-3) | precision_test_report.md §3.3 |
+| DSA Indexer (ratio=4) | NPU 单卡, BF16 | 2 | 单序列 bitwise; packed sharing NaN | 本次更新 |
 
 **Mac 测试**：225 passed, 0 skipped
-**NPU 测试**：28/28 passed
+**NPU 测试**：30/30 passed
 
 ### 关键发现
 
@@ -76,17 +77,19 @@ prefix_sharing/
 | 5 | Packed vs Padded 两条路径 | `kv.ndim==3 and shape[1]>1` 检测分派 | `_g2_padded_store_or_replace` (新增) |
 | 6 | Padded 模式不需要 trim | Store/replace 后全量 Q 等价基线 | 删除 `g2_batch.py` trim 逻辑 |
 | 7 | Packed cu_seqlens_kv 初始化 | 使用 trimmed 长度 `plan.cu_seqlens_q`，Hook 调整为 expanded | 测试构造修正 |
+| 8 | compat_matrix 容器匹配 | 新增 verl=0.8.0.dev + mc=0.12.1 条目 | `mindspeed_deepseek4` patch set |
+| 9 | ratio=4 DSA Indexer args | 补全 `kv_compress`/`index_head_dim`/`index_n_heads` 等字段 | `_LazyArgs` 扩展 |
+| 10 | TP=2 单层不可行 | `LinearNoTP` 不分片，`n_local_heads` 不匹配 | 需 Megatron TP 完整初始化 |
 
 ## 5. 待完成
 
 | 项 | 优先级 | 说明 |
 |----|:--:|------|
-| **verl 集成** | 高 | `wrap_forward_step` 的 `__main__.get_batch` monkey-patch 需适配 verl 路径 |
-| Packed + TP/CP | 高 | packed expand 在 TP>1 或 CP>1 下的 cu_seqlens 兼容性 |
-| ratio=4 DSA Indexer | 中 | DSA Indexer 路径未测试 |
-| Padded ratio=128 全路径 | 低 | 当前 Padded 不支持 topk 重算（kv_compress 不变，无需重算，需 ratio=128 测试确认） |
-| E2E 8 卡精度红线 | 中 | loss/logprob/grad 与 baseline 一致性，需完整 MindSpeed 训练环境 |
-| standalone restore | 低 | `_restore_prefix_last` 适配 pretrain 格式 |
+| **verl E2E forward 对比** | 高 | DeepSeek4Model + verl batch → base vs PS loss。compat+activation+planning 已验证，差最后一步 |
+| Packed + TP/CP | 中 | TP=2 阻塞（LinearNoTP 不分片，需 Megatron TP 初始化）；CP=2 待测 |
+| E2E 8 卡精度红线 | 中 | loss/logprob/grad 与 baseline 一致性，需完整模型权重和训练数据 |
+| standalone restore | 低 | `_restore_prefix_last` 适配 pretrain 格式；padded 模式不需要 |
+| ratio=4 packed sharing | 低 | sparse_flash_mla 兼容问题，非 Hook 逻辑问题 |
 
 ## 6. 经验教训
 
