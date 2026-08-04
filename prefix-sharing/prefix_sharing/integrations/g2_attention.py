@@ -299,7 +299,7 @@ def _g2_kv_store_or_expand(
                     # ratio=4: re-score with expanded indexer_k
                     if expanded_idxk is not None and query_index is not None:
                         new_topk, new_score = attention_module.indexer.forward_with_scores_compress(
-                            x=dsa_hidden, q=query_index, k=expanded_idxk, w=indexer_weights,
+                            x=dsa_hidden, q=query_index, k=expanded_idxk, weights=indexer_weights,
                             mask=attention_mask, packed_seq_params=packed_seq_params,
                             start_pos=start_pos, index_topk=attention_module.indexer.index_topk,
                             offset=0, compress_ratio=compress_ratio)
