@@ -8,9 +8,9 @@
 
 | 指标 | 值 |
 |------|----|
-| 测试阶段 | 3 个（单卡等价性 → 多卡训练 → Packed expand） |
-| 总配置数 | 28 |
-| 通过 | 28 |
+| 测试阶段 | 4 个（单卡等价性 → 多卡训练 → Packed expand → DSA Indexer） |
+| 总配置数 | 30 |
+| 通过 | 30 |
 | 失败 | 0 |
 | 通过率 | **100%** |
 
@@ -139,7 +139,7 @@ NPU 的 linear layer（`ColumnParallelLinear`）在不同 total sequence length 
 | 项目 | 说明 | 计划 |
 |------|------|------|
 | Packed + TP/CP | packed expand 在 TP>1 或 CP>1 下的 cu_seqlens 兼容性 | verl 集成时验证 |
-| ratio=4 DSA Indexer | DSA Indexer 路径未测试 | 功能组 C 开发时验证 |
+| ratio=4 DSA Indexer | 单序列 A≈B bitwise ✅；packed sharing NaN（sparse_flash_mla 兼容）| 后续精度阶段 |
 | Backward gradient | KV-replace 模式下 backward 计算图正确性 | E2E 训练验证 |
 | compress_ratio=128 packed | packed format + 压缩 topk 重算 | 后续精度阶段 |
 
@@ -149,6 +149,8 @@ NPU 的 linear layer（`ColumnParallelLinear`）在不同 total sequence length 
 |---|------|------|
 | 1 | 测试数据未共享 prefix（provider/reuser 用不同 hidden_states）| Provider 和 reuser 共享 `prefix_hidden` |
 | 2 | `cap_allprov` 未定义（step 4c 未开启 capture_intermediates）| 在 step 4c 也开启 capture |
+| 3 | `g2_attention.py` 中 `forward_with_scores_compress` 参数名 `w` → `weights` | DSAIndexer 实际签名用 `weights` |
+| 4 | DSA Indexer 缺少 `kv_compress`/`index_head_dim` 等 args | 补全 `_LazyArgs` 字段 |
 
 ## 8. 代码变更汇总（全部阶段）
 
