@@ -674,6 +674,7 @@ def build_prefix_sharing_micro_batch_verl080(
         attention_backend=get_backend_instance(ps_config),
         packed_batch_layout=packed_layout,
         parallel_info=parallel_info,
+        model_type="deepseek4",
     )
 
     print(
