@@ -145,6 +145,26 @@ def _g2_padded_store_or_replace(
                 else:
                     kv_compress[:cmp_p] = provider.kv_compress[:cmp_p]
 
+    # ── Stats reporting ──────────────────────────────────────────
+    if ctx.stats is not None:
+        _store_count = sum(1 for i in range(layout.batch_size) if plan.is_provider[i])
+        _reuse_count = sum(1 for i in range(layout.batch_size) if plan.is_reuser(i))
+        _stored_tokens = sum(
+            layout.valid_lengths[i] for i in range(layout.batch_size) if plan.is_provider[i])
+        _reused_prefix_tokens = sum(
+            plan.prefix_lens[i] for i in range(layout.batch_size) if plan.is_reuser(i))
+        _expanded_kv_tokens = sum(layout.valid_lengths)  # padded: total valid lengths unchanged
+        ctx.stats.record_attention_kv_build(
+            layer_id=layer_id, store_count=_store_count,
+            reuse_count=_reuse_count, reuse_hit_count=_reuse_count,
+            reuse_miss_count=0,
+            stored_tokens=_stored_tokens,
+            reused_prefix_tokens=_reused_prefix_tokens,
+            expanded_kv_tokens=_expanded_kv_tokens,
+            valid_q_tokens=sum(layout.valid_lengths),
+            padded_q_tokens=sum(layout.padded_lengths),
+        )
+
     return (kv, kv_compress, indexer_k,
             compress_topk_idxs, packed_seq_params, compress_topk_score)
 
@@ -353,6 +373,28 @@ def _g2_kv_store_or_expand(
                 new_cmp.append(cmp_rows[batch_idx][:valid_len // compress_ratio])
             if idxk_rows:
                 new_idxk.append(idxk_rows[batch_idx][:valid_len // compress_ratio])
+
+    # ── Stats reporting ──────────────────────────────────────────
+    if ctx.stats is not None:
+        _store_count = sum(1 for i in range(layout.batch_size) if plan.is_provider[i])
+        _reuse_count = sum(1 for i in range(layout.batch_size) if plan.is_reuser(i))
+        _stored_tokens = sum(
+            layout.valid_lengths[i] for i in range(layout.batch_size) if plan.is_provider[i])
+        _reused_prefix_tokens = sum(
+            plan.prefix_lens[i] for i in range(layout.batch_size) if plan.is_reuser(i))
+        _expanded_kv_tokens = sum(
+            (plan.prefix_lens[i] + layout.valid_lengths[i]) if plan.is_reuser(i)
+            else layout.valid_lengths[i] for i in range(layout.batch_size))
+        ctx.stats.record_attention_kv_build(
+            layer_id=layer_id, store_count=_store_count,
+            reuse_count=_reuse_count, reuse_hit_count=_reuse_count,
+            reuse_miss_count=0,
+            stored_tokens=_stored_tokens,
+            reused_prefix_tokens=_reused_prefix_tokens,
+            expanded_kv_tokens=_expanded_kv_tokens,
+            valid_q_tokens=sum(layout.valid_lengths),
+            padded_q_tokens=sum(layout.padded_lengths),
+        )
 
     # Adjust cu_seqlens for reusers (offsets all subsequent entries)
     if packed_seq_params is not None:

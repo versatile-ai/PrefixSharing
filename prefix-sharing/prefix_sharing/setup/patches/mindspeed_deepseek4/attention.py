@@ -11,6 +11,7 @@ from __future__ import annotations
 from prefix_sharing.integrations.context import current_prefix_sharing_context
 from prefix_sharing.core.prefix_store import G2AttentionStore
 from prefix_sharing.integrations.g2_attention import _g2_kv_store_or_expand
+from megatron.core.transformer.identity_op import IdentityOp
 
 
 def patch_g2_attention(original_forward):
@@ -125,7 +126,7 @@ def patch_g2_attention(original_forward):
 
         if self.compress_ratio > 1:
             offset = 0 if self.use_sparse_flash_attn else kv.size(0)
-            if self.indexer is not None:
+            if self.indexer is not None and not isinstance(self.indexer, IdentityOp):
                 query_index, key_index, weights, dsa_hidden_states = (
                     self.indexer.forward_with_index_compress(
                         hidden_states.detach(), q_compressed.detach(),
