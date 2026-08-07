@@ -159,7 +159,7 @@ def patch_g2_attention(original_forward):
         kv_compress = None
         if self.compress_ratio > 1:
             kv_compress = self.compressor(
-                hidden_states, start_pos, local_freqs_cis, packed_seq_params)
+                hidden_states, start_pos, self.freqs_cis, packed_seq_params)
             if kv_compress is not None:
                 if self.config.sequence_parallel or self.kv_allgather:
                     kv_compress = gather_from_sp_cp(kv_compress)
