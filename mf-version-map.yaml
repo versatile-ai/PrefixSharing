@@ -1,0 +1,25 @@
+# MF 版本组合 → PS 兼容性映射
+#
+# 此文件是 compat_matrix.py 的对外投影——更新 compat_matrix.py 时同步更新此文件。
+# 每个条目表示"此 MF 版本组合已通过 PS 精度红线验证"。
+# 当 MF 升级框架版本时，新版本组合必须在此有对应条目才能启用 PS。
+#
+# PS 自身修 bug 发新 commit:
+#   重新在目标 MF 版本组合上跑 NPU 精度验证 → 更新对应条目的 ps_commit + verified 日期。
+#   MF 下次重新构建镜像（跑 Skill 4）时自动拉到新 commit。
+
+entries:
+  - key: "mf-deepseek-v4-flash-v25"
+    # ps_commit = 添加本 yaml 之前的 HEAD（即通过 NPU 精度红线验证的那个代码 commit）
+    ps_commit: "19acfe9a961181573ec7a257682bc50b914be3d0"
+    verl: "0.8.0.dev"
+    megatron_core: "0.12.1"
+    mindspeed: null               # dsv4 容器 mindspeed 无版本标记
+    cann: "9.1.0-beta.3"
+    patch_set_id: "mindspeed_deepseek4"
+    verified: "2026-08-07"
+    notes: "18/18 single-card bitwise; 4/4 G2 layers matches_expected"
+    test_results:
+      unit_tests: "225/225 passing (Mac)"
+      npu_tests: "30/30 passing (NPU)"
+      precision: "18/18 bitwise equivalence"

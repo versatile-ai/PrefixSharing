@@ -428,3 +428,39 @@ verl 通过桥接层实现 HuggingFace 权重与 Megatron 权重的在线转换�
 ```bash
 actor_rollout_ref.model.megatron.vanilla_mbridge=False
 ```
+
+## 6. Model Factory 集成
+
+PrefixSharing 作为一个独立演进的能力模块，被 [Model Factory](https://github.com/versatile-ai/automodelwire)（NPU 模型工厂）集成。Model Factory 在构建镜像时（Skill 4），将 PS 代码预置到 `/opt/prefix-sharing/`。
+
+### mf-version-map.yaml
+
+`mf-version-map.yaml`（本文件）是 **compat_matrix.py 的对外投影**——它声明了哪些 Model Factory 版本组合已通过 PS 精度红线验证。
+
+| 字段 | 说明 |
+|------|------|
+| `key` | MF 版本组合标识，格式 `mf-<model-slug>-<image-version>` |
+| `ps_commit` | 通过 NPU 精度验证的 PS commit hash |
+| `verl` / `megatron_core` / `mindspeed` / `cann` | 目标框架版本 |
+| `patch_set_id` | 匹配的 patch 集合（对应 `setup/patches/` 目录） |
+| `verified` | 精度验证通过日期 |
+| `test_results` | 测试结果摘要 |
+
+### 新增 MF 版本条目
+
+当 Model Factory 升级了框架版本，需要 PS 适配时：
+
+1. 在 PS 仓库中 vendor 新版本 MindSpeed/Megatron/verl
+2. 修 patch（如有 break），跑 `pytest tests/ -x -q`
+3. 在 NPU 上跑精度红线验证（bitwise 对比 baseline）
+4. 更新 `compat_matrix.py`（PS 自身版本门禁）
+5. **同步更新** `mf-version-map.yaml`，新增对应的 MF 版本条目
+6. Model Factory 下次构建镜像时自动读取新条目
+
+### PS 自身升级
+
+PS 修了 bug、发了新 commit 后：
+
+1. 在目标 MF 版本组合的 NPU 环境上重新跑精度红线验证
+2. 更新 `mf-version-map.yaml` 中对应条目的 `ps_commit` 和 `verified` 日期
+3. Model Factory 下次重新跑 Skill 4 构建镜像时自动拉到新 commit
