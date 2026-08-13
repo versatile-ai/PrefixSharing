@@ -72,31 +72,33 @@ def _compute_cmp_lengths(
     compress_ratio: int,
     kv_compress_shape_0: int,
 ) -> list[int]:
-    """Compute per-sequence compressed-KV padded lengths.
+    """Compute per-sequence compressed-KV lengths, adjusted for TP padding.
 
-    ``kv_compress`` has dim=0 ``sum(valid_len // ratio)``, which differs
-    from the Q-path ``padded_lengths``.  This helper derives the per-row
-    lengths from ``valid_lengths`` and asserts they sum to the actual
-    tensor length (to catch compressor-internal padding mismatches).
+    With TP>1 and ``sequence_parallel=True`` the compressor TP-pads each
+    rank's output before ``gather_from_sp_cp`` concatenates them.  The
+    total ``kv_compress.shape[0]`` may be larger than ``sum(valid//ratio)``.
+    We distribute the excess padding to the last sequence's length so that
+    ``_split_by_cu_seqlens`` can split the tensor without error.
 
     Args:
         layout: :class:`PackedBatchLayout` whose ``valid_lengths`` are used.
         compress_ratio: Compression ratio (e.g. 128).
-        kv_compress_shape_0: Actual ``kv_compress.shape[0]`` for validation.
+        kv_compress_shape_0: Actual ``kv_compress.shape[0]``.
 
     Returns:
-        Per-sequence compressed lengths ``[valid_0 // ratio, …]``.
-
-    Raises:
-        AssertionError: If the computed sum does not match *kv_compress_shape_0*.
+        Per-sequence compressed lengths.  The last entry may include TP
+        padding so the sum matches *kv_compress_shape_0*.
     """
     lengths = [vl // compress_ratio for vl in layout.valid_lengths]
     computed_sum = sum(lengths)
-    assert computed_sum == kv_compress_shape_0, (
-        f"CMP KV length mismatch: computed={computed_sum} "
-        f"!= actual={kv_compress_shape_0}. "
-        f"compressor may apply TP padding — adjust _compute_cmp_lengths accordingly"
-    )
+    remainder = kv_compress_shape_0 - computed_sum
+    if remainder > 0:
+        lengths[-1] += remainder
+        print(
+            f"[PS_DEBUG] CMP KV TP padding: computed={computed_sum} "
+            f"actual={kv_compress_shape_0}, added {remainder} to last seq",
+            flush=True,
+        )
     return lengths
 
 

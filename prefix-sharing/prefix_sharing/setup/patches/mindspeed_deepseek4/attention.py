@@ -110,8 +110,14 @@ def patch_g2_attention(original_forward):
         kv = kv.transpose(0, 1)
         kv[..., -self.rope_head_dim:] = apply_rotary_emb(kv[..., -self.rope_head_dim:], local_freqs_cis)
         kv = kv.transpose(0, 1)
+        _kv_pre_gather = kv.shape[0]
         if self.config.sequence_parallel or self.kv_allgather:
             kv = gather_from_sp_cp(kv)
+        import os as _os_debug
+        if _os_debug.environ.get("PS_DEBUG") == "1":
+            print(f"[PS_DEBUG] KV gather: rank={torch.distributed.get_rank()}, "
+                  f"cp_size={cp_size}, kv_allgather={self.kv_allgather}, "
+                  f"pre_gather={_kv_pre_gather}, post_gather={kv.shape[0]}", flush=True)
 
         if _capture:
             _cap['kv_after_gather'] = kv.detach()  # check 8
@@ -158,8 +164,12 @@ def patch_g2_attention(original_forward):
         # Phase 3: Compressed KV
         kv_compress = None
         if self.compress_ratio > 1:
+            # Use local_freqs_cis (SP-local length) — NOT self.freqs_cis
+            # (global).  The compressor processes SP-sharded hidden_states
+            # and needs matching per-rank freqs.  self.freqs_cis was sliced
+            # to global length at line 75 for the Q path, not for compressor.
             kv_compress = self.compressor(
-                hidden_states, start_pos, self.freqs_cis, packed_seq_params)
+                hidden_states, start_pos, local_freqs_cis, packed_seq_params)
             if kv_compress is not None:
                 if self.config.sequence_parallel or self.kv_allgather:
                     kv_compress = gather_from_sp_cp(kv_compress)
@@ -168,6 +178,16 @@ def patch_g2_attention(original_forward):
             _cap['kv_compress_before_hook'] = kv_compress.detach()  # check 9
 
         # ═══════════ Hook: Store / Expand ═══════════
+        # Clone compress tensors to avoid autograd "view+inplace" conflict.
+        # compress_topk_idxs/score may be views from compressor's custom
+        # Function. _g2_kv_store_or_expand modifies them in-place for reuser
+        # batches (topk index remap + score re-compute). Cloning first gives
+        # the hook owned tensors to work on; the returned values replace the
+        # local variables so Phase 4 picks up the modified copies.
+        if compress_topk_idxs is not None:
+            compress_topk_idxs = compress_topk_idxs.clone()
+        if compress_topk_score is not None:
+            compress_topk_score = compress_topk_score.clone()
         indexer_k = key_index if self.indexer is not None else None
         kv, kv_compress, indexer_k, compress_topk_idxs, packed_seq_params, \
             compress_topk_score = (
