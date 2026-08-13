@@ -68,10 +68,11 @@ COMPAT_MATRIX: list[CompatEntry] = [
         verl="0.8.0.dev",
         megatron_core="0.12.1",
         mindspeed=None,
-        patch_set_id="mindspeed_deepseek4",
+        patch_set_id="verl080_mcore0121_dsv4",
         notes="verl 0.8.0 + megatron-core 0.12.1; "
               "DeepSeek V4 Flash container (CANN 9.1, deepseek-rl:910b-cann9.1-vllm0.23-v23-sparse); "
-              "no MindSpeed version detectable",
+              "no MindSpeed version detectable; "
+              "verl engine patches + G2 attention hook (无 mcore Attention patch)",
     ),
     # 组合四：DeepSeek V4 Flash standalone pretrain (non-verl path)
     CompatEntry(
