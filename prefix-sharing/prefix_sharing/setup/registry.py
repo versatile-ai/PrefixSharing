@@ -103,7 +103,12 @@ def _activate_import_hook(
         print("[PS] Import hook already active, skipping re-activation")
         return
 
-    lookup = {spec.module_name: spec for spec in pending_specs}
+    # 同一模块可能有多个待安装的 patch（如 transformer_impl 上的
+    # forward_step 和 vocab_parallel_log_probs_from_logits），
+    # 必须用 multimap 保留全部 spec，dict 会按 module_name 去重丢 spec。
+    lookup: dict[str, list[PatchSpec]] = {}
+    for spec in pending_specs:
+        lookup.setdefault(spec.module_name, []).append(spec)
     _original_import = builtins.__import__
 
     def hooked_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -111,35 +116,36 @@ def _activate_import_hook(
         module = _original_import(name, globals, locals, fromlist, level)
 
         if name in lookup:
-            spec = lookup.pop(name)
+            specs = lookup.pop(name)
             # __import__ 在 fromlist 为空时返回顶层包而非子模块，
             # 必须从 sys.modules 取实际加载的模块对象。
             actual_module = sys.modules[name]
 
-            try:
-                target_obj, attr_name = spec.target_getter(actual_module)
-                original = getattr(target_obj, attr_name)
-                patched = spec.patch_factory(original)
-                setattr(target_obj, attr_name, patched)
-                shared_records.append(
-                    PatchRecord(
-                        target=target_obj,
-                        attr_name=attr_name,
-                        original=original,
-                        replacement=patched,
+            for spec in specs:
+                try:
+                    target_obj, attr_name = spec.target_getter(actual_module)
+                    original = getattr(target_obj, attr_name)
+                    patched = spec.patch_factory(original)
+                    setattr(target_obj, attr_name, patched)
+                    shared_records.append(
+                        PatchRecord(
+                            target=target_obj,
+                            attr_name=attr_name,
+                            original=original,
+                            replacement=patched,
+                        )
                     )
-                )
-                print(
-                    f"[PS] Auto-patched {spec.description} on import of {name}"
-                )
-            except (AttributeError, KeyError):
-                # 模块已加载但目标仍未定义——
-                # 这种情况极少发生，通常是模块结构异常。
-                print(
-                    f"[PS] Could not resolve target for {spec.description} "
-                    f"after import of {name}; skipping this patch. "
-                    f"The patch target may not exist in this module version."
-                )
+                    print(
+                        f"[PS] Auto-patched {spec.description} on import of {name}"
+                    )
+                except (AttributeError, KeyError):
+                    # 模块已加载但目标仍未定义——
+                    # 这种情况极少发生，通常是模块结构异常。
+                    print(
+                        f"[PS] Could not resolve target for {spec.description} "
+                        f"after import of {name}; skipping this patch. "
+                        f"The patch target may not exist in this module version."
+                    )
 
             if not lookup:
                 builtins.__import__ = _original_import
