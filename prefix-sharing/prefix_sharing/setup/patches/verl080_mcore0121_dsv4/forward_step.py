@@ -11,47 +11,6 @@ from __future__ import annotations
 from typing import Any
 
 
-def _ps_forward_step_probe(event: str, **fields: Any) -> None:
-    """Emit a compact rank-aware probe for distributed hang diagnosis."""
-
-    try:
-        from prefix_sharing.integrations.parallel_info import get_megatron_parallel_info
-
-        parallel_info = get_megatron_parallel_info()
-        rank_prefix = (
-            f"global_rank={parallel_info.global_rank} "
-            f"tp_rank={parallel_info.tp_rank}/tp_size={parallel_info.tp_size} "
-            f"pp_rank={parallel_info.pp_rank}/pp_size={parallel_info.pp_size} "
-            f"cp_rank={parallel_info.cp_rank}/cp_size={parallel_info.cp_size}"
-        )
-    except Exception as exc:
-        rank_prefix = f"parallel_info_unavailable={type(exc).__name__}:{exc}"
-
-    field_text = " ".join(f"{key}={value}" for key, value in fields.items())
-    suffix = f" {field_text}" if field_text else ""
-    print(f"[PS][forward_step][{rank_prefix}] {event}{suffix}", flush=True)
-
-
-def _describe_batch(batch: Any) -> str:
-    try:
-        keys = list(batch.keys())
-    except Exception:
-        keys = []
-
-    pieces = [f"type={type(batch).__name__}", f"keys={keys[:8]}"]
-    for key in ("input_ids", "attention_mask", "position_ids", "labels"):
-        try:
-            value = batch[key]
-        except Exception:
-            continue
-        shape = getattr(value, "shape", None)
-        is_nested = getattr(value, "is_nested", None)
-        pieces.append(f"{key}_shape={tuple(shape) if shape is not None else None}")
-        if is_nested is not None:
-            pieces.append(f"{key}_is_nested={is_nested}")
-    return ",".join(pieces)
-
-
 def patch_verl_forward_step(original_forward_step: Any) -> Any:
     """创建 MegatronEngineWithLMHead.forward_step 的 patch wrapper。"""
 
@@ -66,23 +25,14 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
         # batch_iter 来自外层 engine 的 forward_step 调用方。
         # 消费 batch，由 build_prefix_sharing_micro_batch_verl080 进行物理裁剪
         # 返回 trimmed_batch（物理裁剪后的 micro-batch）和 ps_state。
-        _ps_forward_step_probe("enter")
-        _ps_forward_step_probe("before_next_batch")
         original_batch = next(batch_iter)
-        _ps_forward_step_probe("after_next_batch", batch=_describe_batch(original_batch))
         batch_for_forward = original_batch
 
         # ── 读取配置 ──
-        _ps_forward_step_probe("before_read_config")
         from prefix_sharing.integrations.verl_mcore import read_ps_config_from_engine_config
         from prefix_sharing.core.config import PrefixSharingConfig
         ps_config_raw = read_ps_config_from_engine_config(self.engine_config)
         ps_config = PrefixSharingConfig.from_raw(ps_config_raw)
-        _ps_forward_step_probe(
-            "after_read_config",
-            enable_prefix_sharing=ps_config.enable_prefix_sharing,
-            backend=ps_config.backend,
-        )
 
         ps_state = None
         if ps_config.enable_prefix_sharing:
@@ -90,32 +40,13 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
             # 原始 forward_step 会再次 batch.to(device)（幂等）
             from verl.utils.megatron_utils import get_device_id
             device_id = get_device_id()
-            _ps_forward_step_probe("before_batch_to_device", device_id=device_id)
             batch_on_device = original_batch.to(device_id)
-            _ps_forward_step_probe("after_batch_to_device")
 
             # batch裁剪
-            _ps_forward_step_probe("before_prepare_micro_batch")
             from prefix_sharing.integrations.verl_mcore import build_prefix_sharing_micro_batch_verl080
             batch_for_forward, ps_state = build_prefix_sharing_micro_batch_verl080(
                 self, batch_on_device, ps_config,
             )
-            _ps_forward_step_probe(
-                "after_prepare_micro_batch",
-                has_runtime_state=ps_state is not None,
-                batch=_describe_batch(batch_for_forward),
-                layout=(
-                    None
-                    if ps_state is None
-                    else (
-                        f"valid={ps_state.packed_batch_layout.valid_lengths},"
-                        f"padded={ps_state.packed_batch_layout.padded_lengths},"
-                        f"cu={ps_state.packed_batch_layout.cu_seqlens}"
-                    )
-                ),
-            )
-        else:
-            _ps_forward_step_probe("skip_prepare_prefix_sharing_disabled")
 
         # ##### [PS-diag] dump 元数据 + attention_mask + label_mask（ON/OFF 通用） #####
         # 仅当 PREFIX_SHARING_DIAG_DUMP 设定时触发，否则零开销。
@@ -182,13 +113,19 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
         from prefix_sharing.integrations.context import prefix_sharing_runtime_context
         from contextlib import nullcontext
 
-        context_manager = (
-            prefix_sharing_runtime_context(ps_state)
-            if ps_state is not None
-            else nullcontext()
-        )
+        # [PS-fix14 改动B] 手动 ctx 生命周期:原 with-block 在 forward_step 返回时
+        # 即退出(reset + store.close),而 loss/backward 由 schedule 在返回后执行,
+        # checkpoint 重放趟(backward 内)的 patched forward 因此 ctx=None 走
+        # original_forward → 未挂 hook 的裁剪前向 → NaN。
+        # 改为:入口先关上一 mb 的 ctx(PP=1 严格串行,其 backward 已完成),
+        # 再开启本 mb 的 ctx(不自动关闭);关闭移到下一 mb 入口 / 批末 finally。
+        from prefix_sharing.integrations.context import (
+            _ps_close_context, _ps_open_context)
+        _ps_close_context()
+        if ps_state is not None:
+            _ps_open_context(ps_state)
+        context_manager = nullcontext()
 
-        _ps_forward_step_probe("before_original_forward_step", has_runtime_state=ps_state is not None)
         with context_manager:
             output = original_forward_step(
                 self,
@@ -248,7 +185,6 @@ def patch_verl_forward_step(original_forward_step: Any) -> Any:
                     if _is_nested_tensor(_ent):
                         dump_entropy_2d_verl080(nested_to_2d_full(_ent, _ol, _Lmax), _tag)
             # ##### [PS-diag] dump 2D logprobs/entropy end #####
-        _ps_forward_step_probe("after_original_forward_step")
         return output
 
     return patched_forward_step

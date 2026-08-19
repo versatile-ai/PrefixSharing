@@ -18,6 +18,11 @@ _current_context: ContextVar["PrefixSharingRuntimeContext | None"] = ContextVar(
     "prefix_sharing_context",
     default=None,
 )
+# [PS-fix14] megatron checkpoint 的重放趟可能在另一线程执行;ContextVar 是
+# 线程局部的,重放线程看不到 forward 线程 set 的 ctx → 重放趟 guard 落到
+# original_forward → NaN。PP=1 串行调度下用模块级全局即可(线程安全由
+# GIL + 串行调度保证)。
+_current_context_global: "PrefixSharingRuntimeContext | None" = None
 
 
 @dataclass
@@ -83,7 +88,7 @@ class PrefixSharingRuntimeContext:
 
 
 def current_prefix_sharing_context() -> PrefixSharingRuntimeContext | None:
-    return _current_context.get()
+    return _current_context_global
 
 
 def _create_store(runtime_state: Any) -> PrefixActivationStore:
@@ -147,15 +152,48 @@ def prefix_sharing_runtime_context(
 
     store = _create_store(prefix_sharing_runtime_state)
     ctx = PrefixSharingRuntimeContext(prefix_sharing_runtime_state, store)
-    token = _current_context.set(ctx)
+    global _current_context_global
+    _current_context_global = ctx
     try:
         yield ctx
     finally:
-        _current_context.reset(token)
+        _current_context_global = None
         _log_prefix_sharing_audit(ctx)
         ctx.store.close()
 
 
+def _ps_open_context(prefix_sharing_runtime_state: Any) -> PrefixSharingRuntimeContext | None:
+    """[PS-fix14] 开启 runtime context 且不自动关闭。
+
+    手动生命周期:ctx 必须存活到本 micro-batch 的 backward 完成(megatron
+    checkpoint 重放趟在 backward 中执行,重放趟的 patched forward 需要 ctx 在场
+    才会走 hook)。关闭时机由调用方控制:下一 micro-batch 入口(PP=1 严格串行,
+    上一 mb 的 backward 已完成)或批末 finally(forward_backward_batch patch)。
+    """
+    if prefix_sharing_runtime_state is None:
+        return None
+    store = _create_store(prefix_sharing_runtime_state)
+    ctx = PrefixSharingRuntimeContext(prefix_sharing_runtime_state, store)
+    global _current_context_global
+    _current_context_global = ctx
+    return ctx
+
+
+def _ps_close_context() -> None:
+    """[PS-fix14] 关闭当前活跃的 runtime context(幂等)。
+
+    语义同 prefix_sharing_runtime_context 的 __exit__:审计打印 + store.close()
+    + ContextVar 清空。
+    """
+    global _current_context_global
+    ctx = _current_context_global
+    if ctx is None:
+        return
+    try:
+        _log_prefix_sharing_audit(ctx)
+        ctx.store.close()
+    finally:
+        _current_context_global = None
 def _log_prefix_sharing_audit(ctx: PrefixSharingRuntimeContext) -> None:
     stats = ctx.stats
     if stats is None:

@@ -94,11 +94,6 @@ def _compute_cmp_lengths(
     remainder = kv_compress_shape_0 - computed_sum
     if remainder > 0:
         lengths[-1] += remainder
-        print(
-            f"[PS_DEBUG] CMP KV TP padding: computed={computed_sum} "
-            f"actual={kv_compress_shape_0}, added {remainder} to last seq",
-            flush=True,
-        )
     return lengths
 
 
@@ -129,15 +124,25 @@ def _adjust_cu_seqlens_for_batch(
 
     import torch
 
-    # cu_seqlens_kv_padded takes priority (MindSpeed >= 2.x may define both).
-    _has_padded = (hasattr(packed_seq_params, "cu_seqlens_kv_padded")
-                   and getattr(packed_seq_params, "cu_seqlens_kv_padded") is not None)
-    kv_attr = "cu_seqlens_kv_padded" if _has_padded else "cu_seqlens_kv"
-    old_cu_kv_raw = getattr(packed_seq_params, kv_attr)
+    # [PS-fix8] sparse MLA 读的是非 padded 的 cu_seqlens_kv,而模型两个字段都设置了。
+    # 只调 padded(旧优先级逻辑)会让注意力拿到未调整的 [0,2304,2688],
+    # 与展开后的 KV 表(4608)不匹配 → cmp cu_seqlens 越界 → 稀疏注意力 NaN。
+    # 因此两个字段必须同时调整。
+    def _shift_cu(raw: torch.Tensor) -> torch.Tensor:
+        vals: list[int] = raw.tolist()  # [PS-fix6] 必须是 Python int 副本
+        for batch_idx in range(plan.batch_size):
+            if not plan.is_reuser(batch_idx):
+                continue
+            offset = plan.prefix_lens[batch_idx]
+            for i in range(batch_idx + 1, len(vals)):
+                vals[i] += offset
+        return torch.tensor(vals, dtype=raw.dtype, device=raw.device)
+
+    old_cu_kv_raw = getattr(packed_seq_params, "cu_seqlens_kv", None)
     if old_cu_kv_raw is None:
         return packed_seq_params  # nothing to adjust
     _kv_is_tensor = isinstance(old_cu_kv_raw, torch.Tensor)
-    old_cu_kv: list[int] = list(old_cu_kv_raw)
+    old_cu_kv: list[int] = old_cu_kv_raw.tolist()
 
     for batch_idx in range(plan.batch_size):
         if not plan.is_reuser(batch_idx):
@@ -146,15 +151,20 @@ def _adjust_cu_seqlens_for_batch(
         for i in range(batch_idx + 1, len(old_cu_kv)):
             old_cu_kv[i] += offset
 
-    new_params = replace(packed_seq_params, **{kv_attr:
+    new_kwargs = {"cu_seqlens_kv":
         torch.tensor(old_cu_kv, dtype=old_cu_kv_raw.dtype, device=old_cu_kv_raw.device)
-        if _kv_is_tensor else old_cu_kv})
+        if _kv_is_tensor else old_cu_kv}
+    _padded_raw = getattr(packed_seq_params, "cu_seqlens_kv_padded", None)
+    if _padded_raw is not None:
+        new_kwargs["cu_seqlens_kv_padded"] = _shift_cu(_padded_raw)
+    new_params = replace(packed_seq_params, **new_kwargs)
 
     # cu_seqlens_cmp_kv — same logic with compress_ratio division.
     if hasattr(packed_seq_params, "cu_seqlens_cmp_kv") and packed_seq_params.cu_seqlens_cmp_kv is not None:
         old_cu_cmp_raw = packed_seq_params.cu_seqlens_cmp_kv
         _cmp_is_tensor = isinstance(old_cu_cmp_raw, torch.Tensor)
-        old_cu_cmp: list[int] = list(old_cu_cmp_raw)
+        # [PS-fix6] 同上:list(tensor) → 标量视图原地改;必须 tolist()
+        old_cu_cmp: list[int] = old_cu_cmp_raw.tolist()
         for batch_idx in range(plan.batch_size):
             if plan.is_reuser(batch_idx):
                 cmp_offset = plan.prefix_lens[batch_idx] // compress_ratio

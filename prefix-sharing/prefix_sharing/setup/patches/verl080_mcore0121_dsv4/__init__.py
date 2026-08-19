@@ -39,6 +39,26 @@ _NOPADDING_PATCH_MODULES = [
     "verl.trainer.ppo.ray_trainer",
 ]
 
+def patch_verl_forward_backward_batch(original_forward_backward_batch):
+    """[PS-fix14 改动A] 批末(或异常路径)关闭 PS runtime ctx。
+
+    forward_step patch(改动B)把 ctx 的生命周期改为手动管理,ctx 不再随
+    forward_step 返回而关闭;最后一个 micro-batch 的 ctx 在此处收尾,
+    并覆盖异常路径(正常路径的 ctx 已在下一 mb 入口被关闭,这里幂等)。
+    """
+    def patched_forward_backward_batch(self, data, loss_function, forward_only=False):
+        try:
+            return original_forward_backward_batch(
+                self, data, loss_function, forward_only)
+        finally:
+            try:
+                from prefix_sharing.integrations.context import _ps_close_context
+                _ps_close_context()
+            except Exception:
+                pass
+    return patched_forward_backward_batch
+
+
 PATCH_SET: list[PatchSpec] = [
     PatchSpec(
         module_name="verl.workers.engine.megatron.transformer_impl",
@@ -49,6 +69,16 @@ PATCH_SET: list[PatchSpec] = [
         patch_factory=patch_verl_forward_step,
         description="MegatronEngineWithLMHead.forward_step → "
                     "micro-batch reorg + context (verl 0.8.0 engine)",
+    ),
+    PatchSpec(
+        module_name="verl.workers.engine.megatron.transformer_impl",
+        target_getter=lambda mod: (
+            getattr(mod, "MegatronEngineWithLMHead"),
+            "forward_backward_batch",
+        ),
+        patch_factory=patch_verl_forward_backward_batch,
+        description="MegatronEngineWithLMHead.forward_backward_batch → "
+                    "batch-end ctx close (fix14: ctx 覆盖 backward 重放)",
     ),
     PatchSpec(
         module_name="mindspeed_llm.tasks.models.transformer.deepseek4.g2_attention",

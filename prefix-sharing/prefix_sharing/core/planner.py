@@ -301,6 +301,21 @@ class PrefixSharingPlanner:
         provider_index = list(detection.provider_index)
         prefix_lens = list(detection.prefix_lens)
         reuse_specs = list(detection.reuse_specs)
+        alignment = self.config.prefix_alignment
+        if alignment > 1:
+            # [fix] 对齐到压缩块边界(设计文档 §4.5 Phase 1: 只支持对齐 prefix)。
+            # 检测出的最长公共前缀可能非对齐(实测 1955 % 4 != 0 → hook assert 崩溃),
+            # 向下取整到块边界, 余出的 token 并入 reuser 的 suffix 自算;
+            # reuse_specs 同步修正, 保持"语义真源"一致。
+            import dataclasses as _dc
+
+            for i, plen in enumerate(prefix_lens):
+                if plen > 0:
+                    prefix_lens[i] = plen - (plen % alignment)
+            reuse_specs = [
+                _dc.replace(spec, prefix_len=prefix_lens[spec.reuse_idx_in_batch])
+                for spec in reuse_specs
+            ]
 
         suffix_lens: list[int] = []
         kept_lengths_q: list[int] = []

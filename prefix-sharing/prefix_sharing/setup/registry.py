@@ -115,13 +115,22 @@ def _activate_import_hook(
         global _original_import
         module = _original_import(name, globals, locals, fromlist, level)
 
-        if name in lookup:
-            specs = lookup.pop(name)
+        # [fix] 原实现只匹配 __import__ 的顶层 name:
+        # `from ..megatron import X` 这类相对/父包 from-import 时,
+        # __import__ 收到的是父包名, 目标子模块由 importlib 内部加载,
+        # hook 永远等不到完整子模块名 → 补丁永久 pending (实测:
+        # verl.workers.engine.megatron.transformer_impl 的 forward_step 补丁
+        # 因此从未应用, PS context 未建立, 整条 PS 链路静默旁路)。
+        # 改为每次 import 后扫描全部 pending: 模块已加载且目标可解析即 patch;
+        # 解析失败(模块仍在 import 中)保留在 pending, 待后续 import 重试, 不跳过。
+        for mod_name in list(lookup.keys()):
             # __import__ 在 fromlist 为空时返回顶层包而非子模块，
             # 必须从 sys.modules 取实际加载的模块对象。
-            actual_module = sys.modules[name]
-
-            for spec in specs:
+            actual_module = sys.modules.get(mod_name)
+            if actual_module is None:
+                continue
+            specs = lookup[mod_name]
+            for spec in list(specs):
                 try:
                     target_obj, attr_name = spec.target_getter(actual_module)
                     original = getattr(target_obj, attr_name)
@@ -136,21 +145,19 @@ def _activate_import_hook(
                         )
                     )
                     print(
-                        f"[PS] Auto-patched {spec.description} on import of {name}"
+                        f"[PS] Auto-patched {spec.description} on import scan of {mod_name}"
                     )
+                    specs.remove(spec)
                 except (AttributeError, KeyError):
-                    # 模块已加载但目标仍未定义——
-                    # 这种情况极少发生，通常是模块结构异常。
-                    print(
-                        f"[PS] Could not resolve target for {spec.description} "
-                        f"after import of {name}; skipping this patch. "
-                        f"The patch target may not exist in this module version."
-                    )
+                    # 目标尚未定义(模块仍在 import 中)——保留待重试
+                    pass
+            if not specs:
+                lookup.pop(mod_name)
 
-            if not lookup:
-                builtins.__import__ = _original_import
-                _original_import = None
-                print("[PS] All import hooks resolved, __import__ restored")
+        if not lookup:
+            builtins.__import__ = _original_import
+            _original_import = None
+            print("[PS] All import hooks resolved, __import__ restored")
 
         return module
 

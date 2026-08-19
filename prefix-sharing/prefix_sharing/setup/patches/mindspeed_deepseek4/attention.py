@@ -114,11 +114,6 @@ def patch_g2_attention(original_forward):
         if self.config.sequence_parallel or self.kv_allgather:
             kv = gather_from_sp_cp(kv)
         import os as _os_debug
-        if _os_debug.environ.get("PS_DEBUG") == "1":
-            print(f"[PS_DEBUG] KV gather: rank={torch.distributed.get_rank()}, "
-                  f"cp_size={cp_size}, kv_allgather={self.kv_allgather}, "
-                  f"pre_gather={_kv_pre_gather}, post_gather={kv.shape[0]}", flush=True)
-
         if _capture:
             _cap['kv_after_gather'] = kv.detach()  # check 8
 

@@ -35,12 +35,13 @@ def patch_g2_attention(original_forward):
     ):
         ctx = current_prefix_sharing_context()
         if ctx is None or not isinstance(ctx.store, G2AttentionStore):
-            return original_forward(
+            _out = original_forward(
                 self, hidden_states, attention_mask, rotary_pos_emb,
                 start_pos=start_pos, packed_seq_params=packed_seq_params,
                 attention_bias=attention_bias, inference_context=inference_context,
                 rotary_pos_cos=rotary_pos_cos, rotary_pos_sin=rotary_pos_sin,
                 sequence_len_offset=sequence_len_offset)
+            return _out
 
         # ── Optional: intermediate tensor capture for precision tests ──
         _capture = getattr(ctx, 'capture_intermediates', False)
@@ -70,7 +71,6 @@ def patch_g2_attention(original_forward):
         q_len_local, bsz, _ = hidden_states.shape
         q_len = q_len_local * tp_size if self.config.sequence_parallel else q_len_local
         q_len_global = q_len * cp_size if cp_size > 1 else q_len
-
         self.freqs_cis = rotary_pos_emb[0] if self.compress_ratio > 1 else rotary_pos_emb[1]
         self.freqs_cis = self.freqs_cis[start_pos: start_pos + q_len_global]
         if self.kv_allgather:
@@ -114,11 +114,6 @@ def patch_g2_attention(original_forward):
         if self.config.sequence_parallel or self.kv_allgather:
             kv = gather_from_sp_cp(kv)
         import os as _os_debug
-        if _os_debug.environ.get("PS_DEBUG") == "1":
-            print(f"[PS_DEBUG] KV gather: rank={torch.distributed.get_rank()}, "
-                  f"cp_size={cp_size}, kv_allgather={self.kv_allgather}, "
-                  f"pre_gather={_kv_pre_gather}, post_gather={kv.shape[0]}", flush=True)
-
         if _capture:
             _cap['kv_after_gather'] = kv.detach()  # check 8
 
@@ -132,14 +127,40 @@ def patch_g2_attention(original_forward):
 
         if self.compress_ratio > 1:
             offset = 0 if self.use_sparse_flash_attn else kv.size(0)
+            # [PS-fix11] PS 裁剪下 packed_seq_params.cu_seqlens_kv 是展开布局
+            # (如 [0,2304,4608]),而本阶段 key_index 仍是裁剪后的张量(672 行)。
+            # fused indexer 按 cu_seqlens_kv/ratio 推导 cmp 表(1152 行)去寻址
+            # 672 行的 k → OOB 读 → NaN scores → 垃圾 topk 逐层放大。
+            # 给 indexer 传 kv 侧与裁剪后张量一致的副本(裁剪布局下 kv 侧 == q 侧)。
+            _packed_for_indexer = packed_seq_params
+            if (packed_seq_params is not None
+                    and packed_seq_params.cu_seqlens_kv is not None
+                    and packed_seq_params.cu_seqlens_q is not None):
+                _kv_last = int(packed_seq_params.cu_seqlens_kv[-1])
+                _q_last = int(packed_seq_params.cu_seqlens_q[-1])
+                if _kv_last != _q_last:
+                    from dataclasses import replace as _ps_dc_replace
+                    _packed_for_indexer = _ps_dc_replace(
+                        packed_seq_params,
+                        cu_seqlens_kv=packed_seq_params.cu_seqlens_q.clone(),
+                        cu_seqlens_kv_padded=(
+                            packed_seq_params.cu_seqlens_q_padded.clone()
+                            if packed_seq_params.cu_seqlens_q_padded is not None
+                            else None))
             if self.indexer is not None and not isinstance(self.indexer, IdentityOp):
                 query_index, key_index, weights, dsa_hidden_states = (
                     self.indexer.forward_with_index_compress(
                         hidden_states.detach(), q_compressed.detach(),
-                        start_pos, local_freqs_cis, packed_seq_params))
+                        start_pos, local_freqs_cis, _packed_for_indexer))
                 query_index, key_index, weights = (
                     self.indexer.all_gather_qk_weight_kvallgather(
-                        query_index, key_index, weights))
+                        query_index, key_index, weights,
+                        # [PS-fix11c] TND 下 compressor 输出已是全局压缩表,
+                        # 跳过 k 的二次 gather。否则 key_index 变成 4 份 TP 重复
+                        # (实测 2688 行),非 fused indexer 的 per-rank 窗口落在
+                        # 重复拷贝区域 → ratio=4 层 provider topk 泄漏到拷贝
+                        # 2-4(实测 max=2028/1151)→ 主 kernel 交叉窗口读取 → NaN。
+                        k_is_global=True))
                 dsa_indexer_context = (
                     torch.no_grad() if args.use_fused_lightning_indexer_loss
                     else nullcontext())
@@ -147,7 +168,7 @@ def patch_g2_attention(original_forward):
                     compress_topk_idxs, compress_topk_score = (
                         self.indexer.forward_with_scores_compress(
                             dsa_hidden_states, query_index, key_index, weights,
-                            attention_mask, packed_seq_params, start_pos,
+                            attention_mask, _packed_for_indexer, start_pos,
                             self.indexer.index_topk, offset,
                             self.indexer.compress_ratio))
                     compress_topk_idxs, compress_topk_score = (
@@ -189,10 +210,12 @@ def patch_g2_attention(original_forward):
         if compress_topk_score is not None:
             compress_topk_score = compress_topk_score.clone()
         indexer_k = key_index if self.indexer is not None else None
-        kv, kv_compress, indexer_k, compress_topk_idxs, packed_seq_params, \
-            compress_topk_score = (
-            _g2_kv_store_or_expand(
-                ctx, kv, kv_compress, indexer_k,
+        _disable_hook = __import__("os").environ.get("PS_DISABLE_G2_HOOK") == "1"
+        if not _disable_hook:
+            kv, kv_compress, indexer_k, compress_topk_idxs, packed_seq_params, \
+                compress_topk_score = (
+                _g2_kv_store_or_expand(
+                    ctx, kv, kv_compress, indexer_k,
                 compress_topk_idxs, packed_seq_params,
                 self.compress_ratio, self, start_pos,
                 self.kv_allgather, self.config.sequence_parallel,
@@ -276,7 +299,6 @@ def patch_g2_attention(original_forward):
         o_rotated[..., -self.rope_head_dim:] = apply_rotary_emb(
             o[..., -self.rope_head_dim:], global_freqs_cis, True)
         o = o_rotated.transpose(0, 1)
-
         if _capture:
             _cap['attention_output_rotated'] = o.detach()  # check 14
 
@@ -290,7 +312,6 @@ def patch_g2_attention(original_forward):
             l=self.o_lora_rank, h=self.n_heads, g=self.n_local_groups)
         o = torch.einsum("sbgd,gld->sbgl", o, weight_woa)
         core_attn_out, bias = self.linear_o_up_proj(o.flatten(2))
-
         if _capture:
             _cap['core_attn_out'] = core_attn_out.detach()  # check 15
             _cap['bias'] = bias.detach() if bias is not None else None  # check 16

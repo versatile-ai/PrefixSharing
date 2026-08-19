@@ -265,6 +265,9 @@ def megatron_args(init_distributed, compress_ratio: int, seqlen: int):
         attention_dropout = 0.0
         hidden_dropout = 0.0
         num_layers = 1
+        context_parallel_size = 1
+        context_parallel_algo = "none"
+        transformer_impl = "transformer_engine"
         norm_epsilon = 1e-6
         norm_eps = 1e-6
         swiglu = False
@@ -274,7 +277,7 @@ def megatron_args(init_distributed, compress_ratio: int, seqlen: int):
 
     # Patch the global args — Megatron stores args in a module-level _GLOBAL_ARGS
     try:
-        from megatron.training import arguments as _args_mod
+        from megatron.training import global_vars as _args_mod
         _args_mod._GLOBAL_ARGS = _MinimalArgs()
     except (ImportError, AttributeError):
         try:

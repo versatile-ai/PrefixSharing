@@ -21,6 +21,8 @@ def _read_config_value(config: Any, name: str, default: Any = None) -> Any:
 
 def _env_enables_prefix_sharing() -> bool:
     value = os.getenv("ENABLE_PREFIX_SHARING")
+    if os.path.exists("/tmp/ps_off"):
+        value = "0"
     if value is None:
         return False
     normalized = value.strip().lower()
@@ -66,6 +68,7 @@ class PrefixSharingConfig:
     backend: str = "torch_ref"
     min_prefix_len: int = 1  # Prefixes shorter than this won't be cached (too short = not worth it)
     min_group_size: int = 2  # Groups smaller than this won't share (need 2+ samples to share)
+    prefix_alignment: int = 1  # prefix 对齐到压缩块边界(各压缩比的最小公倍数);1 = 不对齐(通用模型)
     boundary_strategy: str = "prefix_last_restore"
 
     supported_cp_size: int = 1  # Context parallel size supported in phase 1 (1 = no CP)
