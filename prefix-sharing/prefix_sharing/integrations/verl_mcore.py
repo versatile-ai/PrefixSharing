@@ -323,13 +323,20 @@ def restore_reuser_prefix_columns_2d(
         prefix_last_spec = prefix_last_spec_by_reuser.get(reuser_idx)
         if prefix_last_spec is not None:
             saved_logits_key = (reuser_idx, prefix_last_spec.target_2d_pos)
-            saved_provider_logits = ctx.prefix_last_logits_saved[saved_logits_key]  # [1, V//tp]
-            reuser_label = torch.tensor(
-                [prefix_last_spec.label_value], dtype=torch.long, device=log_probs.device,
-            )  # [1]
-            log_probs[reuser_idx, prefix_len - 1] = vocab_parallel_log_probs_fn(
-                saved_provider_logits, reuser_label,
-            ).reshape(())
+            saved_provider_logits = ctx.prefix_last_logits_saved.get(saved_logits_key)
+            if saved_provider_logits is None:
+                # [PS-fix17b] save 侧 CP2 下仅 owner 保存,本 rank 缺失时 fallback:
+                # prefix-last 是 provider/reuser 共享 token(logp 相同),直接复制
+                # provider 行同列 logp(值已算过,在 autograd 图内)。
+                log_probs[reuser_idx, prefix_len - 1] = log_probs[provider_idx, prefix_len - 1]
+            else:
+                reuser_label = torch.tensor(
+                    [prefix_last_spec.label_value], dtype=torch.long,
+                    device=log_probs.device,
+                )  # [1]
+                log_probs[reuser_idx, prefix_len - 1] = vocab_parallel_log_probs_fn(
+                    saved_provider_logits, reuser_label,
+                ).reshape(())
         else:
             # suffix_len == 0: no prefix-last spec; column is masked downstream.
             log_probs[reuser_idx, prefix_len - 1] = log_probs[provider_idx, prefix_len - 1]

@@ -15,6 +15,34 @@
 """
 
 from __future__ import annotations
+def _ps_cp_local_map_verl080(row_start, n_rows, q_total, cp_size, cp_rank):
+    """[PS-fix17b] 全局 1D packed 行区间 → CP 本地行区间(双块交错布局)。
+
+    与 g2_attention._ps_cp_local_map_verl080 同源(kvallgather_context_parallel
+    get_seq_chunk_ids_on_for_sharding:rank r 持块 {r, 2cp-1-r},本地顺序
+    [块r, 块2cp-1-r],块宽 q_total/(2cp))。返回 (local_start, local_end, is_owner)。
+    """
+
+    if cp_size <= 1:
+        return row_start, row_start + n_rows, (
+            0 <= row_start and row_start + n_rows <= q_total)
+    w = q_total // (2 * cp_size)
+    g0 = row_start // w
+    g1 = (row_start + n_rows - 1) // w
+    if g0 != g1:
+        raise RuntimeError(
+            f"[PS-fix17b] 行区间 [{row_start},{row_start + n_rows}) 跨块 {g0}..{g1},"
+            f"不支持(块宽 {w}, 2cp={2 * cp_size})")
+    g = g0
+    if g < cp_size:
+        owner = g
+        local = row_start - g * w
+    else:
+        owner = 2 * cp_size - 1 - g
+        local = w + (row_start - g * w)
+    return local, local + n_rows, owner == cp_rank
+
+
 
 from typing import Any
 
@@ -82,8 +110,37 @@ def patch_megatron_vocab(original_fn: Any) -> Any:
                         f"key={key} provider_1d_pos={pos}. "
                         f"prefix-last 应在直接 provider 的 packed 区段内。"
                     )
+                # [PS-fix17b] logits_2d 是 CP 分片后的 packed 1D（实测 N=1344=2688/2，
+                # 行序 = attention query 行序：kvalgather 双块交错，rank r 持块
+                # {r, 2cp-1-r}）。pos 是全局 packed 位置（如 1919）→ 双块映射到本
+                # rank 局部行，仅 owner 保存；非 owner 跳过（该行在别的 CP rank，
+                # restore 侧对该 key 走 fallback 复制，见 verl_mcore fix17b）。
+                _lay_b = getattr(ctx, "packed_batch_layout", None)
+                _q_total_b = 0
+                if _lay_b is not None:
+                    _q_total_b = int(getattr(_lay_b, "total_valid_length", 0) or 0)
+                if _q_total_b <= 0:
+                    _q_total_b = int(logits_2d.shape[0]) * 2
+                _cp_size_b, _cp_rank_b = 1, 0
+                try:
+                    from megatron.core import parallel_state
+                    _cp_size_b = parallel_state.get_context_parallel_world_size()
+                    _cp_rank_b = parallel_state.get_context_parallel_rank()
+                except (ImportError, RuntimeError, AssertionError):
+                    pass
+                _l0_b, _l1_b, _is_owner_b = _ps_cp_local_map_verl080(
+                    pos, 1, _q_total_b, _cp_size_b, _cp_rank_b)
+                if __import__("os").environ.get("PS_DIAG_VOCAB_CP") is not None:
+                    print(
+                        f"[PS-fix17b] key={key} pos={pos} N={logits_2d.shape[0]} "
+                        f"cp=({_cp_rank_b}/{_cp_size_b}) q_total={_q_total_b} "
+                        f"local=[{_l0_b},{_l1_b}) owner={_is_owner_b}",
+                        flush=True,
+                    )
+                if not _is_owner_b:
+                    continue
                 # clone 保留 autograd 图（restore 重算 logp 要走反向传播，禁止 detach）。
-                saved = logits_2d[pos:pos + 1, :].clone()  # [1, V//tp]
+                saved = logits_2d[_l0_b:_l1_b, :].clone()  # [1, V//tp]
                 if saved.shape[0] == 0:
                     raise RuntimeError(
                         f"[vocab_logprobs] empty logits slice: key={key} "
