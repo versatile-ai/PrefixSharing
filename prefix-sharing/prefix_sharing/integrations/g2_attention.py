@@ -133,6 +133,9 @@ def _g2_padded_store_or_replace(
             slot_id = PrefixActivationSlotId(
                 plan.forward_id, plan.micro_batch_id, layer_id,
                 provider_idx, PREFIX_STATE_TYPE_G2_ATTENTION, tp_rank)
+            if __import__("os").environ.get("PS_CACHE_OFF") == "1":
+                # [PS-dualpass] 方案 5 缓存短路:跳过拼接(padded 防御路径,训练不走)
+                continue
             provider = ctx.store.load(slot_id)
 
             kv[:prefix_len, batch_idx, :] = provider.kv[:prefix_len]
@@ -166,6 +169,32 @@ def _g2_padded_store_or_replace(
 
     return (kv, kv_compress, indexer_k,
             compress_topk_idxs, packed_seq_params, compress_topk_score)
+
+
+def _ps_cp_local_map_verl080(row_start, n_rows, q_total, cp_size, cp_rank):
+    """[PS-fix17] 全局 1D packed 行区间 → CP 本地行区间(双块交错布局)。
+
+    kvallgather_context_parallel.get_seq_chunk_ids_on_for_sharding:
+    rank r 持块 {r, 2cp-1-r},本地顺序 [块r, 块2cp-1-r],块宽 q_total/(2cp)。
+    区间须整块对齐(跨块 raise 暴露)。返回 (local_start, local_end, is_owner)。
+    """
+    if cp_size <= 1:
+        return row_start, row_start + n_rows, (0 <= row_start and row_start + n_rows <= q_total)
+    w = q_total // (2 * cp_size)
+    g0 = row_start // w
+    g1 = (row_start + n_rows - 1) // w
+    if g0 != g1:
+        raise RuntimeError(
+            f"[PS-fix17] 行区间 [{row_start},{row_start + n_rows}) 跨块 {g0}..{g1},"
+            f"不支持(块宽 {w}, 2cp={2 * cp_size})")
+    g = g0
+    if g < cp_size:
+        owner = g
+        local = row_start - g * w
+    else:
+        owner = 2 * cp_size - 1 - g
+        local = w + (row_start - g * w)
+    return local, local + n_rows, owner == cp_rank
 
 
 def _g2_kv_store_or_expand(
@@ -285,7 +314,38 @@ def _g2_kv_store_or_expand(
             slot_id = PrefixActivationSlotId(
                 plan.forward_id, plan.micro_batch_id, layer_id,
                 provider_idx, PREFIX_STATE_TYPE_G2_ATTENTION, tp_rank)
-            provider = ctx.store.load(slot_id)
+            if __import__("os").environ.get("PS_CACHE_OFF") == "1":
+                # [PS-dualpass v2] 缓存短路修正(语义同裁决):不能"跳过拼接"——plan
+                # 的 cu 布局期望 expanded_kv,行数不足 → fused kernel 越界 NaN(实证
+                # rank1 ratio=4 nan=3031040)。正确语义:reuser 用本次计算的 provider
+                # kv 行(同 forward,kv_rows[provider_idx] 截 valid_len),非 store
+                # 历史值 → 布局保持 expand,唯一差异 = store 读写路径(bf16 保真)。
+                _pv_kv = kv_rows[provider_idx][:layout.valid_lengths[provider_idx]]
+                _pv_cmp = (cmp_rows[provider_idx][:layout.valid_lengths[provider_idx] // compress_ratio]
+                           if cmp_rows else None)
+                _pv_idxk = (idxk_rows[provider_idx][:layout.valid_lengths[provider_idx] // compress_ratio]
+                            if idxk_rows else None)
+            else:
+                print(f"[VAL-DBG] rank={torch.distributed.get_rank()} layer={layer_id} enter-load PS_CACHE_OFF={__import__('os').environ.get('PS_CACHE_OFF')} GRAD_DUAL_PASS={__import__('os').environ.get('GRAD_DUAL_PASS')}", flush=True)
+                _provider_ent = ctx.store.load(slot_id)
+                _pv_kv = _provider_ent.kv
+                _pv_cmp = _provider_ent.kv_compress
+                _pv_idxk = _provider_ent.indexer_k
+                # [PS-VAL v2] 值级探针:同趟比较缓存返回值 vs provider 本次计算值。
+                # v1 门控 GRAD_DUAL_PASS 在 forward 进程恒 None(跨进程 env 不共享,
+                # VAL-DBG 3d 实证)→ 去掉。计数改 per-(rank,layer),每对前 12 次采样。
+                _ps_val_src = kv_rows[provider_idx][:layout.valid_lengths[provider_idx]]
+                _ps_val_ok = _pv_kv.shape == _ps_val_src.shape and (_pv_kv.data_ptr() == _ps_val_src.data_ptr())
+                _ps_val_md = ((_pv_kv.detach().float() - _ps_val_src.detach().float()).abs().max().item()
+                              if _pv_kv.shape == _ps_val_src.shape else float("inf"))
+                _pv_key = (layer_id, torch.distributed.get_rank())
+                _pv_ns = __import__("prefix_sharing.integrations.g2_attention", fromlist=["_PS_VAL_N"]).__dict__.setdefault("_PS_VAL_N", {})
+                _pv_n = _pv_ns.get(_pv_key, 0)
+                if _ps_val_md > 0 or _pv_n < 12:
+                    # v1.1:异常行(maxdiff>0)带 slot 标识,定位键错配/对象被改
+                    _ps_val_extra = f" slot={slot_id}" if _ps_val_md > 0 else ""
+                    print(f"[PS-VAL] rank={torch.distributed.get_rank()} layer={layer_id} maxdiff={_ps_val_md:.3e} same_ptr={_ps_val_ok} shape={tuple(_pv_kv.shape)} n={_pv_n}{_ps_val_extra}", flush=True)
+                _pv_ns[_pv_key] = _pv_n + 1
             # Expand kv
             _swap_layout = __import__("os").path.exists("/tmp/ps_swap_layout")
             if _swap_layout:
@@ -293,10 +353,10 @@ def _g2_kv_store_or_expand(
                 # 查询位置与真实位置对齐(ori ±127 窗口正确),前缀放批尾。
                 expanded_kv = torch.cat([
                     kv_rows[batch_idx][:valid_len],
-                    provider.kv[:prefix_len]], dim=0)
+                    _pv_kv[:prefix_len]], dim=0)
             else:
                 expanded_kv = torch.cat([
-                    provider.kv[:prefix_len],
+                    _pv_kv[:prefix_len],
                     kv_rows[batch_idx][:valid_len]], dim=0)
             new_kv.append(expanded_kv)
 
@@ -308,10 +368,10 @@ def _g2_kv_store_or_expand(
                 if _swap_layout:
                     expanded_cmp = torch.cat([
                         cmp_rows[batch_idx][:cmp_s],
-                        provider.kv_compress[:cmp_p]], dim=0)
+                        _pv_cmp[:cmp_p]], dim=0)
                 else:
                     expanded_cmp = torch.cat([
-                        provider.kv_compress[:cmp_p],
+                        _pv_cmp[:cmp_p],
                         cmp_rows[batch_idx][:cmp_s]], dim=0)
                 new_cmp.append(expanded_cmp)
 
@@ -323,97 +383,129 @@ def _g2_kv_store_or_expand(
                 if _swap_layout:
                     expanded_idxk = torch.cat([
                         idxk_rows[batch_idx][:idxk_s],
-                        provider.indexer_k[:idxk_p]], dim=0)
+                        _pv_idxk[:idxk_p]], dim=0)
                 else:
                     expanded_idxk = torch.cat([
-                        provider.indexer_k[:idxk_p],
+                        _pv_idxk[:idxk_p],
                         idxk_rows[batch_idx][:idxk_s]], dim=0)
                 new_idxk.append(expanded_idxk)
 
             # THD format (bsz=1): map batch_idx to tensor batch dim 0
             _topk_batch_idx = 0 if compress_topk_idxs is not None and compress_topk_idxs.shape[0] == 1 else batch_idx
 
+            import os as _os_dbg4
+            if _os_dbg4.path.exists("/tmp/ps_dbg_topk"):
+                with open("/tmp/ps_dbg_topk.log", "a") as _f4:
+                    _f4.write(f"ENTER layer={layer_id} batch={batch_idx} ratio={compress_ratio} cpi={tuple(compress_topk_idxs.shape) if compress_topk_idxs is not None else None} valid={valid_len} rc={_ps_is_recompute} qi={tuple(query_index.shape) if query_index is not None else None} vl={layout.valid_lengths}\n")
             # Recompute topk for expanded key space
             if compress_topk_idxs is not None and compress_ratio > 1 and                     __import__("os").environ.get("PS_DISABLE_TOPK_RESCORE") != "1":
                 if hasattr(attention_module, 'indexer') and attention_module.indexer is not None:
                     # ratio=4: re-score with expanded indexer_k
                     if expanded_idxk is not None and query_index is not None:
-                        # [PS-fix11b] SP 局部空间自洽的直接重评分。
-                        # 关键事实(实测 + 代码确认):
-                        #  - query_index/indexer_weights/dsa_hidden 是 SP 局部张量,
-                        #    每 rank 672 行(全局 2688 的 1/4 分片);
-                        #  - expanded_idxk 是全局压缩表(576 行 = 480 前缀 + 96 后缀),
-                        #    fix7 已按 Q 侧真实长度截断,无 TP 重复;
-                        #  - 全局 reuser 行 [_row_start, _row_start+valid_len) 只落在
-                        #    最后一个 TP rank 的局部区间。
-                        # 因此不再复用 forward_with_scores_compress(它的 cu/窗口
-                        # 推导与局部切片语义不匹配),直接按 non-fused indexer 的
-                        # 等价逻辑评分:bf16 内积 + 显式因果窗口 topk,然后 TP 组
-                        # 广播,保证所有 rank 的 compress_topk_idxs 一致。
+                        # [PS-leak-mask 2026-08-28] 泄漏防护核查(LEAK-PROBE 基线实证):
+                    # fix17 重评只处理 reuser 行,expanded 表 = provider 前缀 + 自己
+                    # 后缀,表内全合法(下界 s_k=0,无非法块);exactwin 原始输出侧由
+                    # dsa_indexer 的 _seg_start_c 下界屏蔽,provider 私有后缀块 0 命中。
+                    # 压缩候选通道泄漏计数 = 0。若未来批次引入无关样本(一般样本)形态,
+                    # 在此叠加 '< 段起点' 下界屏蔽(score -> -inf before topk)。
+                    # [PS-fix17] CP 双块布局重评分重写(替代 fix11b)。
+                        # fix11b 的 CP1×TP4 假设(每 rank 672 行、reuser 落最后 TP
+                        # rank)在 CP2 下失效:query_index 336 行 = CP 本地 1344 的
+                        # TP 分片,旧局部映射全负 → 跳过 → torch.empty 垃圾写回。
+                        # 重写:TP all_gather 拼 CP 本地 1344 行 → 双块映射得
+                        # reuser 本地 [960,1344) → 仅 owner CP rank 重评分写回;
+                        # 窗口同 fix12b 用 ceil((prefix_len + j + ratio) // ratio)。
                         _row_start = sum(layout.valid_lengths[:batch_idx])
-                        _cmp_offset_local = sum(
-                            vl // compress_ratio for vl in layout.valid_lengths[:batch_idx])
-                        import torch.distributed as _ps_dist11
-                        from megatron.core import parallel_state as _ps_mpu11
+                        _q_total17 = sum(layout.valid_lengths)
+                        import torch.distributed as _ps_dist17
+                        from megatron.core import parallel_state as _ps_mpu17
                         from mindspeed_llm.tasks.models.transformer.dsa_indexer import (
-                            bf16_index as _ps_bf16_index)
-                        _tp_size11 = _ps_mpu11.get_tensor_model_parallel_world_size()
-                        _tp_rank11 = _ps_mpu11.get_tensor_model_parallel_rank()
+                            bf16_index as _ps_bf16_index17)
+                        _tp_size17 = _ps_mpu17.get_tensor_model_parallel_world_size()
+                        _cp_size17 = _ps_mpu17.get_context_parallel_world_size()
+                        _cp_rank17 = _ps_mpu17.get_context_parallel_rank()
                         _local_n = query_index.shape[0]
-                        _shard_start = _local_n * _tp_rank11
-                        _l0 = max(0, _row_start - _shard_start)
-                        _l1 = min(_local_n, _row_start + valid_len - _shard_start)
-                        n_local_reuser = _l1 - _l0
+                        _l0, _l1, _is_owner17 = _ps_cp_local_map_verl080(
+                            _row_start, valid_len, _q_total17, _cp_size17, _cp_rank17)
                         _topk_w = min(int(attention_module.indexer.index_topk),
                                       int(expanded_idxk.shape[0]))
-                        _dev11 = query_index.device
+                        _dev17 = query_index.device
                         _new_topk_all = torch.empty(
-                            (valid_len, _topk_w), dtype=torch.int32, device=_dev11)
+                            (valid_len, _topk_w), dtype=torch.int32, device=_dev17)
                         _new_score_all = torch.empty(
-                            (valid_len, _topk_w), dtype=torch.float32, device=_dev11)
-                        if n_local_reuser > 0:
-                            _q_local = query_index[_l0:_l1].contiguous()
-                            _w_local = indexer_weights[_l0:_l1]
-                            _k_global = expanded_idxk.contiguous()
-                            _scores = _ps_bf16_index(
-                                _q_local, _w_local.unsqueeze(-1), _k_global)
-                            # [PS-fix12] 窗口上限对齐 kernel 的 ceil 约定:
-                            # kernel s2IdLimit = (cmpMaskRight + s1EndIdx + 1)/cmpRatio
-                            # = (1920+j+1)/4; hook 原 floor(480+j//4), j%4==3 时差 1 行
-                            # -> kernel 多读 1 列未初始化 -> NaN
-                            _win = ((prefix_len + torch.arange(n_local_reuser, device=_dev11) + 1)
-                                    // compress_ratio).to(torch.int32)
-                            _mask11 = (torch.arange(_k_global.shape[0], device=_dev11)
-                                       .unsqueeze(0).to(torch.int32) >= _win.unsqueeze(1))
-                            _scores = _scores + torch.where(
-                                _mask11, torch.finfo(_scores.dtype).min, 0)
-                            _topk_score_l, _topk_idxs_l = _scores.topk(_topk_w, dim=-1)
-                            # [PS-fix11b3] bf16_index 返回 (b, s_q, s_k) 三维(b=1),
-                            # topk 后为 (1, n_local, K),压掉 batch 维再写入二维缓冲。
-                            _topk_idxs_l = _topk_idxs_l[0].int()
-                            _topk_score_l = _topk_score_l[0]
-                            _mask12 = _topk_idxs_l >= _win.unsqueeze(1)
-                            _topk_idxs_l = torch.where(_mask12, -1, _topk_idxs_l)
-                            _new_topk_all.copy_(_topk_idxs_l)
-                            _new_score_all.copy_(_topk_score_l)
-                        _src_tp_rank11 = min(_row_start // _local_n, _tp_size11 - 1)
-                        _tp_group11 = _ps_mpu11.get_tensor_model_parallel_group()
-                        # megatron-core 无 get_tensor_model_parallel_global_ranks,
-                        # 用 torch 标准 API 从进程组取全局 rank 列表。
-                        _grp_ranks11 = torch.distributed.get_process_group_ranks(
-                            _tp_group11)
-                        _src_global11 = int(_grp_ranks11[_src_tp_rank11])
-                        _ps_dist11.broadcast(_new_topk_all, src=_src_global11, group=_tp_group11)
-                        _ps_dist11.broadcast(_new_score_all, src=_src_global11, group=_tp_group11)
-                        # [PS-fix13-rc] 两次 pass 的 reuser topk/score 位级比对。
-                        # call#==1 存快照(按 key,forward_id 变更时清理旧 key);
-                        # call#==2 比对。topk 差异 = 重算 pass 与首次 pass 选择不同的
-                        # 压缩块(recompute 非位级确定);score 按 uint8 字节比对。
+                            (valid_len, _topk_w), dtype=torch.float32, device=_dev17)
+                        _tp_group17 = _ps_mpu17.get_tensor_model_parallel_group()
+                        if _is_owner17:
+                            # TP all_gather:336 行碎片 → CP 本地 1344 行(TP rank 序)
+                            _qi_g17 = [torch.empty_like(query_index)
+                                       for _ in range(_tp_size17)]
+                            _ps_dist17.all_gather(_qi_g17, query_index, group=_tp_group17)
+                            _wi_g17 = [torch.empty_like(indexer_weights)
+                                       for _ in range(_tp_size17)]
+                            _ps_dist17.all_gather(_wi_g17, indexer_weights, group=_tp_group17)
+                            _qi_full17 = torch.cat(_qi_g17, dim=0)
+                            _wi_full17 = torch.cat(_wi_g17, dim=0)
+                            _q_local17 = _qi_full17[_l0:_l1].contiguous()
+                            _w_local17 = _wi_full17[_l0:_l1]
+                            _k_global17 = expanded_idxk.contiguous()
+                            _scores17 = _ps_bf16_index17(
+                                _q_local17, _w_local17.unsqueeze(-1), _k_global17)
+                            # floor+1 窗口(= kernel s2IdLimit = N，与 indexer F1 同式):
+                            _win17 = ((prefix_len
+                                       + torch.arange(valid_len, device=_dev17)
+                                       + 1)
+                                      // compress_ratio).to(torch.int32)
+                            # [L1-audit] LEAK-PROBE 2c 20步验证 foreign=0，下界屏蔽(s_k)暂无需新增(2026-08-29)
+                            _mask17 = (torch.arange(_k_global17.shape[0], device=_dev17)
+                                       .unsqueeze(0).to(torch.int32) >= _win17.unsqueeze(1))
+                            _scores17 = _scores17 + torch.where(
+                                _mask17, torch.finfo(_scores17.dtype).min, 0)
+                            _ts_l17, _ti_l17 = _scores17.topk(_topk_w, dim=-1)
+                            _ti_l17 = _ti_l17[0].int()
+                            _ts_l17 = _ts_l17[0]
+                            _mask18 = _ti_l17 >= _win17.unsqueeze(1)
+                            _ti_l17 = torch.where(_mask18, -1, _ti_l17)
+                            _new_topk_all.copy_(_ti_l17)
+                            _new_score_all.copy_(_ts_l17)
+                            # TP 组内广播,保证 4 个 TP rank 的 cpi 副本一致
+                            _grp_r17 = torch.distributed.get_process_group_ranks(
+                                _tp_group17)
+                            _ps_dist17.broadcast(_new_topk_all, src=int(_grp_r17[0]),
+                                                 group=_tp_group17)
+                            _ps_dist17.broadcast(_new_score_all, src=int(_grp_r17[0]),
+                                                 group=_tp_group17)
                         q_len_local = valid_len
                         topk_len = min(_topk_w, compress_topk_idxs.shape[-1])
                         # 广播后的行 [0:valid_len) 即 reuser 的查询;写回 packed 表的
                         # reuser 区段,并把本地索引偏移到展开 cmp 表的 reuser 区段起点。
                         _new_topk_vals = _new_topk_all[:q_len_local, :topk_len].clone()
+
+                        # [PS-fix13-rc] 两次 pass 的 reuser topk/score 位级比对(实现)。
+                        # 首次 pass(call#==1,rc=False)存快照;重放趟(call#==2,rc=True)
+                        # 比对。topk 差异 = 重算 pass 与首次 pass 选择不同的压缩块
+                        # (recompute 非位级确定);score 按 uint8 字节比对。
+                        # 仅 owner CP rank 参与(非 owner 的 _new_topk_vals 是空张量)。
+                        if _is_owner17:
+                            _rc_key = (_ps_rc_key[0], _ps_rc_key[1], layer_id, batch_idx)
+                            _snaps = getattr(ctx, "_ps_rc_snapshots", None)
+                            if _snaps is None:
+                                _snaps = {}
+                                ctx._ps_rc_snapshots = _snaps
+                            if _ps_is_recompute:
+                                _ref_rc = _snaps.pop(_rc_key, None)
+                                if _ref_rc is not None:
+                                    _d_t = int((_new_topk_vals != _ref_rc[0]).sum().item())
+                                    _d_s = int(
+                                        (_new_score_all.view(torch.uint8)
+                                         != _ref_rc[1].view(torch.uint8)).sum().item())
+                                    print(
+                                        f"[PS-fix13-rc] L{layer_id} b{batch_idx} "
+                                        f"REPLAY topk_diff={_d_t}/{_new_topk_vals.numel()} "
+                                        f"score_byte_diff={_d_s}", flush=True)
+                            else:
+                                _snaps[_rc_key] = (
+                                    _new_topk_vals.clone(),
+                                    _new_score_all.clone())
                         # [PS-fix11d 实验] 不加全局 cmp 偏移,验证 sparse MLA kernel 的
                         # topk 索引是否为 per-batch 相对解释(相对本 batch 的 cmp 区段起点)。
                         # provider 区段起点是 0,两种解释等价,所以 provider 一直正常;
@@ -429,9 +521,28 @@ def _g2_kv_store_or_expand(
                         if (_os_h.environ.get("PS_REUSER_CMP_OFF") == "1"
                                 or _os_h.path.exists("/tmp/ps_reuser_cmp_off")):
                             _new_topk_vals[:] = -1
-                        compress_topk_idxs[_topk_batch_idx,
-                                           _row_start:_row_start + q_len_local,
-                                           :topk_len] = _new_topk_vals
+                        import os as _os_dbg3
+                        if _os_dbg3.path.exists("/tmp/ps_dbg_topk"):
+                            with open("/tmp/ps_dbg_topk.log", "a") as _f3:
+                                _f3.write(f"WRITE layer={layer_id} batch={batch_idx} valid={valid_len} tb={_topk_batch_idx} rs={_row_start} cpi={tuple(compress_topk_idxs.shape)} nv={tuple(_new_topk_vals.shape)} tw={_topk_w} klen={topk_len} rc={_ps_is_recompute} qi={tuple(query_index.shape)} idxk={tuple(expanded_idxk.shape) if expanded_idxk is not None else None} vl={layout.valid_lengths} tp={tp_rank}\n")
+                        import os as _os_lp
+                        if _os_lp.path.exists("/tmp/ps_leak_probe") and _is_owner17:
+                            _lp_raw = compress_topk_idxs[_topk_batch_idx, _l0:_l1, :topk_len].clone()
+                            _lp_p = prefix_len // compress_ratio
+                            _lp_neg = int((_lp_raw < 0).sum().item())
+                            _lp_pfx = int(((_lp_raw >= 0) & (_lp_raw < _lp_p)).sum().item())
+                            _lp_nw = _new_topk_vals.clone()
+                            _lp_nw_neg = int((_lp_nw < 0).sum().item())
+                            _lp_nw_pfx = int(((_lp_nw >= 0) & (_lp_nw < _lp_p)).sum().item())
+                            _lp_nw_oob = int((_lp_nw >= expanded_idxk.shape[0]).sum().item())
+                            with open("/tmp/ps_leak_probe.log", "a") as _flp:
+                                _flp.write(f"LP L{layer_id} b{batch_idx} tp{tp_rank} valid={valid_len} rows={_l1 - _l0} pfx={_lp_p} raw_neg={_lp_neg} raw_pfx={_lp_pfx} new_neg={_lp_nw_neg} new_pfx={_lp_nw_pfx} new_oob={_lp_nw_oob}\n")
+                        # [PS-fix17] 双块布局下仅 owner CP rank 写回本地
+                        # [l0, l1);非 owner 的 cpi 无 reuser 行,跳过。
+                        if _is_owner17:
+                            compress_topk_idxs[_topk_batch_idx,
+                                               _l0:_l1,
+                                               :topk_len] = _new_topk_vals
                         if compress_topk_score is not None:
                             # [PS-fix11g] 窗口 < topk 宽度时 topk 会选入被 mask 的条目
                             # (idx=-1, score=finfo.min)。finfo.min(-3.4e38) 写回
@@ -439,10 +550,11 @@ def _g2_kv_store_or_expand(
                             # score——这是 hook 独有输入,置 0.0 消除。
                             _new_score_vals = _new_score_all[:q_len_local, :topk_len].clone()
                             _new_score_vals[_new_topk_vals == -1] = 0.0
-                            compress_topk_score[_topk_batch_idx,
-                                               _row_start:_row_start + q_len_local,
-                                               :topk_len] = \
-                                _new_score_vals.to(compress_topk_score.dtype)
+                            if _is_owner17:
+                                compress_topk_score[_topk_batch_idx,
+                                                   _l0:_l1,
+                                                   :topk_len] = \
+                                    _new_score_vals.to(compress_topk_score.dtype)
                 else:
                     # ratio=128: recompute by position with expanded seqlen
                     tp_size = 1
@@ -458,28 +570,47 @@ def _g2_kv_store_or_expand(
                     q_len_global = q_len * cp_size if cp_size > 1 else q_len
                     expanded_seqlen = prefix_len + q_len_global
                     bsz = compress_topk_idxs.shape[0]
-                    new_idxs = attention_module.get_compress_topk_idxs(
-                        compress_ratio, bsz, expanded_seqlen,
-                        start_pos=start_pos, offset=0, cp_shard=kv_allgather)
-                    topk_len = min(new_idxs.shape[-1],
-                                   compress_topk_idxs.shape[-1])
-                    # get_compress_topk_idxs returns LOCAL indices [0, seqlen//r).
-                    # Add provider's CMP block offset to convert to global packed indices.
-                    # Provider CMP blocks before this reuser = global offset
-                    # [PS-fix7b] cmp_lengths 已随 fix7 移除:用 Q 侧真实 cmp 长度求和
-                    _cmp_offset = (
-                        sum(vl // compress_ratio for vl in layout.valid_lengths[:batch_idx])
-                        if cmp_rows else 0
-                    )
-                    _new_idxs = new_idxs[_topk_batch_idx, -q_len_local:, :topk_len].clone()
-                    _new_idxs[_new_idxs >= 0] += _cmp_offset
+                    # [PS-fix19] 弃用 get_compress_topk_idxs:内部 floor bug
+                    # (mask = arange(1,seqlen+1)//ratio → 每窗口第 1 位置整行全遮、
+                    # 其余行缺自己窗口);且 [-q_len_local:] 取 expanded 表末尾 +
+                    # offset=0(cmp_rows=None)→ 写回 idx 达 35 > cpi 槽 21
+                    # (实测 MLA-CP-IDX oob=True)→ kernel OOB 读 → NaN。
+                    # 改为与 fix11b 同款坐标:每行窗口 = ceil((prefix_len + j)/ratio)
+                    # (per-batch 相对,与 fix16 写回同坐标系),槽 = [0, win) 递增,
+                    # 超出置 -1。
+                    # [PS-fix21] fix19A 重写删掉了 topk_len 定义(旧定义在
+                    # get_compress_topk_idxs 调用的 min() 内)。此处按 cpi 槽数定:
+                    # ratio=128 → cpi 槽 21;窗口上限 19 ≤ 21,_new_idxs 已掩码截断,
+                    # 超出槽数的槽位写 -1,与 fix16 坐标系一致。
+                    topk_len = compress_topk_idxs.shape[-1]
+                    _dev16b = compress_topk_idxs.device
+                    _win16b = ((prefix_len
+                                + torch.arange(q_len_local, device=_dev16b)
+                                + 1)
+                               // compress_ratio).to(torch.int32)
+                    _new_idxs = torch.arange(
+                        topk_len, device=_dev16b).to(torch.int32) \
+                        .unsqueeze(0).expand(q_len_local, topk_len).clone()
+                    _new_idxs[_new_idxs >= _win16b.unsqueeze(1)] = -1
                     # [PS-fix11] 与 indexer 分支相同的行定位修复:reuser 的行位于
                     # packed 表的 [_row_start, _row_start+q_len_local),
                     # 写 [0:q_len_local) 会覆盖 provider 的 topk。
                     _row_start_p = sum(layout.valid_lengths[:batch_idx])
-                    compress_topk_idxs[_topk_batch_idx,
-                                       _row_start_p:_row_start_p + q_len_local,
-                                       :topk_len] = _new_idxs
+                    # [PS-fix17] ratio=128 分支:new_idxs 为 CP 本地表(负索引在
+                    # owner rank 恰取 reuser 行),写回同走双块映射,仅 owner 写回。
+                    try:
+                        from megatron.core import parallel_state
+                        _cp_rank16b = parallel_state.get_context_parallel_rank()
+                        _cp_size16b = parallel_state.get_context_parallel_world_size()
+                    except (ImportError, RuntimeError, AssertionError):
+                        _cp_rank16b, _cp_size16b = 0, 1
+                    _l0b, _l1b, _is_owner16b = _ps_cp_local_map_verl080(
+                        _row_start_p, q_len_local, sum(layout.valid_lengths),
+                        _cp_size16b, _cp_rank16b)
+                    if _is_owner16b:
+                        compress_topk_idxs[_topk_batch_idx,
+                                           _l0b:_l1b,
+                                           :topk_len] = _new_idxs
 
             # Store back for transitive reuse
             own_slot = PrefixActivationSlotId(
@@ -527,13 +658,59 @@ def _g2_kv_store_or_expand(
     result_cmp = torch.cat(new_cmp, dim=0) if new_cmp else (kv_compress if has_cmp else None)
     result_idxk = torch.cat(new_idxk, dim=0) if new_idxk else (indexer_k if has_idxk else None)
 
-    # [PS-fix10 实验性] indexer 的 topk 索引空间与展开 cmp 表不匹配(实测 max=2028 > 1151)。
-    # 先把越界索引钳制为 -1(哨兵,"无块"),验证越界是 NaN 的唯一原因;
-    # 语义级重映射是后续 PS 仓工作。
+    # [PS-fix10 收编] 越界 topk 索引钳制为表尾(兜底防御):rescore(fix12)后值域
+    # 已段内自洽,正常不触发;触发时打印告警(不再静默掩盖),语义级重映射是后续工作。
     if compress_topk_idxs is not None and result_cmp is not None:
         _cmp_n = result_cmp.shape[0]
         _n_clamped = int((compress_topk_idxs > _cmp_n - 1).sum())
+        if _n_clamped > 0:
+            print(f"[PS] WARNING: clamped {_n_clamped} out-of-range topk indices "
+                  f"(max={int(compress_topk_idxs.max())}, cmp_n={_cmp_n})", flush=True)
         compress_topk_idxs = compress_topk_idxs.clamp(max=_cmp_n - 1)
+
+    # [PS-fix22-sentinel] 毒判别实验(peer 机制假设:kernel 消费槽数 deal >
+    # host 有效槽数 win → 消费进 −1 区 → vector 跳 −1 早退 → merge 欠填 →
+    # cube 按 deal 读陈旧尾 → NaN)。把 −1 槽替换为合法 idx(win−1 重复填充):
+    # 毒消失 → 实锤 −1 跳读欠填;毒不变 → 机制在 dense 侧。
+    _diag22 = str(__import__("os").environ.get("PS_SENTINEL_FILL"))+ "/file:" + ("Y" if __import__("os").path.exists("/tmp/ps_sentinel_fill") else "N")
+    print(f"[PS-sentinel-diag] env={_diag22!r} cpi={None if compress_topk_idxs is None else tuple(compress_topk_idxs.shape)} neg={int((compress_topk_idxs == -1).sum()) if compress_topk_idxs is not None else -1} cmin={int(compress_topk_idxs.min()) if compress_topk_idxs is not None else -1} cmax={int(compress_topk_idxs.max()) if compress_topk_idxs is not None else -1} padded={_is_padded} rc={_ps_is_recompute} kv={tuple(kv.shape)} layer={layer_id}", flush=True)
+    # PS_SENTINEL_FILL=1:全填;=K(K>1):只填前 K 个 −1 槽(二分找最小毒消失 K
+    # = kernel 真实 deal,得精确 cmpMaskRight)。
+    import os as _os_s22
+    # [PS-fix22-file] ray 常驻集群(8-20 起)worker env 不继承训练脚本 export
+    # (诊断实证 env=None);改文件开关,与 ps_swap_layout 同模式。内容=fill 值。
+    _ps_sentinel = None
+    if _os_s22.path.exists("/tmp/ps_sentinel_fill"):
+        try:
+            with open("/tmp/ps_sentinel_fill") as _f22:
+                _ps_sentinel = _f22.read().strip() or "1"
+        except Exception:
+            _ps_sentinel = "1"
+    if _ps_sentinel is not None and compress_topk_idxs is not None:
+        _sf22 = int(_ps_sentinel)
+        _neg22 = compress_topk_idxs == -1
+        if bool(_neg22.any()):
+            # 行内第一个 −1 的列位置 = win(探针实证:valid=[0,win)、−1=[win,512),
+            # neg_n=Σ(512−win) 逐项吻合)。填充值 = win−1(行内最后合法槽)。
+            _wins22 = _neg22.int().argmax(dim=-1, keepdim=True)
+            if _sf22 == 0:
+                # fill=0: −1 槽全填 0(0 < 一切 s2IdLimit → 全部真实 gather)
+                _fill22 = torch.zeros_like(_wins22).to(compress_topk_idxs.dtype)
+            else:
+                _fill22 = torch.clamp(_wins22 - 1, min=0).to(compress_topk_idxs.dtype)
+            if _sf22 > 1:
+                _cols22 = torch.arange(
+                    compress_topk_idxs.shape[-1],
+                    device=compress_topk_idxs.device,
+                    dtype=torch.int64).unsqueeze(0).unsqueeze(0)
+                _mask22 = _neg22 & ((_cols22 - _wins22) < _sf22)
+            else:
+                _mask22 = _neg22
+            compress_topk_idxs = torch.where(
+                _mask22, _fill22.expand_as(_neg22), compress_topk_idxs)
+            print(f"[PS-sentinel] fill={_sf22} replaced={int(_mask22.sum())} "
+                  f"neg_total={int(_neg22.sum())} "
+                  f"win=[{int(_wins22.min())},{int(_wins22.max())}]", flush=True)
 
     return (result_kv, result_cmp, result_idxk,
             compress_topk_idxs, packed_seq_params, compress_topk_score)
