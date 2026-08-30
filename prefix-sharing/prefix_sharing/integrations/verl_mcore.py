@@ -594,6 +594,7 @@ def build_prefix_sharing_micro_batch_verl080(
         return batch, None
 
     # ── 阶段 1: 配置校验 ──
+    # 2026-08-29 BSND(use_remove_padding=False)不再抛错,只记录警告(config.py 用户拍板)
     use_remove_padding = getattr(engine_self.engine_config, "use_remove_padding", True)
     ps_config.validate_for_engine(use_remove_padding=use_remove_padding)
 

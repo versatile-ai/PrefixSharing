@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Mapping
+
+logger = logging.getLogger(__name__)
 
 
 class PrefixSharingConfigError(ValueError):
@@ -235,9 +238,13 @@ class PrefixSharingConfig:
             raise PrefixSharingConfigError("min_group_size must be >= 2")
 
         # THD packed layout 需要 use_remove_padding
+        # 2026-08-29 用户拍板:BSHD 路径硬拦截拆除(场景 1 stock 训练须保持 vendor
+        # 原生 BSND 形态可跑)。已知约束/风险仅记录不拦截:
+        #   - BSND 块边界对齐无代码保证(依赖 seq%TP==0 的 2 的幂配置惯例)
+        #   - fork 只按 THD 验证过,BSND 走 plain-2D+attention_mask 路径
         if not use_remove_padding:
-            raise PrefixSharingConfigError(
-                "[Config Error] Phase 1 THD 路径要求 use_remove_padding=True。"
-                "BSHD 路径 (use_remove_padding=False) 尚未在当前 patch 中支持，"
-                "请启用 use_remove_padding 或使用 BSHD 专用 patch set。"
+            logger.warning(
+                "Prefix sharing Phase 1 建议 use_remove_padding=True(THD)。"
+                "BSHD 路径 (use_remove_padding=False) 已知约束:块边界对齐无代码保证、"
+                "fork 仅按 THD 验证——以警告记录,不阻断(2026-08-29 用户拍板)。"
             )
