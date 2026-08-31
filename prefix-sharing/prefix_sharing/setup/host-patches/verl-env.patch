@@ -1,0 +1,240 @@
+# host-patches: verl-env.patch — E1-E10 部署必需(集群特定)
+# 目标树:verl 809f2d8f。E2 资源名/E3 GLOO 网卡名/E10 PORT_RANGE 为集群特定值,换集群必查。
+# 实验件剥离:PS_SKIP_WEIGHT_SYNC 各类调用点与包装方法已还原为直接 update_weights。
+
+diff --git a/verl/checkpoint_engine/hccl_checkpoint_engine.py b/verl/checkpoint_engine/hccl_checkpoint_engine.py
+--- a/verl/checkpoint_engine/hccl_checkpoint_engine.py
++++ b/verl/checkpoint_engine/hccl_checkpoint_engine.py
+@@ -93,7 +93,7 @@
+         return self.metadata
+ 
+ 
+-@CheckpointEngineRegistry.register("nccl")
++@CheckpointEngineRegistry.register("hccl")
+ class HCCLCheckpointEngine(CheckpointEngine):
+     """HCCL checkpoint engine with collective communication.
+ 
+diff --git a/verl/single_controller/ray/base.py b/verl/single_controller/ray/base.py
+--- a/verl/single_controller/ray/base.py
++++ b/verl/single_controller/ray/base.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ import inspect
++import json
+ import logging
+ import os
+ import socket
+@@ -141,6 +142,27 @@
+             device_name = "GPU"
+ 
+         bundle = {"CPU": self.max_colocate_count}
++        # verl-ascend patch: constrain rollout placement groups to labeled nodes.
++        # When VERL_ROLLOUT_BUNDLE_CUSTOM_RESOURCES is set (JSON dict, e.g. '{"rollout_node": 1e-4}'),
++        # rollout pools (name_prefix contains "rollout_pool") require that custom resource in every bundle,
++        # so they can only be placed on nodes advertising it (i.e. dedicated inference nodes).
++        # verl-ascend patch (fixed): match "rollout" so rollout_standalone_* groups are
++        # actually pinned to rollout_node; and pin every other (train) group to train_node
++        # via VERL_TRAIN_BUNDLE_CUSTOM_RESOURCES so train workers never float onto
++        # inference nodes and OOM against CheckpointEngineWorker/vLLM there.
++        _np = self.name_prefix or ""
++        _custom_res = os.getenv("VERL_ROLLOUT_BUNDLE_CUSTOM_RESOURCES")
++        if _custom_res and "rollout" in _np:
++            try:
++                bundle.update(json.loads(_custom_res))
++            except Exception:
++                pass
++        _custom_res_train = os.getenv("VERL_TRAIN_BUNDLE_CUSTOM_RESOURCES")
++        if _custom_res_train and "rollout" not in _np:
++            try:
++                bundle.update(json.loads(_custom_res_train))
++            except Exception:
++                pass
+         if self.use_gpu:
+             bundle[device_name] = 1
+             if self.accelerator_type is not None:
+diff --git a/verl/trainer/constants_ppo.py b/verl/trainer/constants_ppo.py
+--- a/verl/trainer/constants_ppo.py
++++ b/verl/trainer/constants_ppo.py
+@@ -31,6 +31,12 @@
+         # https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/maintenref/envvar/envref_07_0143.html
+         "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
+         "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
++        "VERL_ROLLOUT_BUNDLE_CUSTOM_RESOURCES": "{\"rollout_node\": 1e-4}",
++        "VERL_TRAIN_BUNDLE_CUSTOM_RESOURCES": "{\"train_node\": 1e-4}",
++        "ASCEND_CUSTOM_OPP_PATH": "/usr/local/Ascend/vendors/custom_transformer",
++        "GLOO_SOCKET_IFNAME": "enp67s0f5",
++        "VLLM_ASCEND_ENABLE_MC2": "0",
++        "ASCEND_LAUNCH_BLOCKING": os.environ.get("ASCEND_LAUNCH_BLOCKING", "0"),
+     },
+ }
+ 
+@@ -49,6 +55,6 @@
+         **({"working_dir": None} if working_dir is None else {}),
+     }
+     for key in list(runtime_env["env_vars"].keys()):
+-        if os.environ.get(key) is not None:
++        if key not in ("VERL_ROLLOUT_BUNDLE_CUSTOM_RESOURCES", "VERL_TRAIN_BUNDLE_CUSTOM_RESOURCES", "ASCEND_CUSTOM_OPP_PATH") and os.environ.get(key) is not None:
+             runtime_env["env_vars"].pop(key, None)
+     return runtime_env
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -870,12 +870,16 @@
+         # To stream teacher computation with actor rollout, we instead pass the full manager so that the
+         # teacher loop workers can sleep/wake together with rollout workers
+         reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+-        self.async_rollout_manager = AgentLoopManager.create(
+-            config=self.config,
+-            worker_group=self.actor_rollout_wg,
+-            rollout_resource_pool=actor_rollout_resource_pool,
+-            reward_loop_worker_handles=reward_loop_worker_handles,
+-            teacher_model_manager=self.teacher_model_manager,
++        import asyncio
++        self.async_rollout_manager = asyncio.run(
++            AgentLoopManager.create.__func__.__wrapped__(
++                AgentLoopManager,
++                config=self.config,
++                worker_group=None if self.config.actor_rollout_ref.rollout.get("nnodes", 0) > 0 else self.actor_rollout_wg,
++                rollout_resource_pool=actor_rollout_resource_pool,
++                reward_loop_worker_handles=reward_loop_worker_handles,
++                teacher_model_manager=self.teacher_model_manager,
++            )
+         )
+ 
+         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+diff --git a/verl/utils/device.py b/verl/utils/device.py
+--- a/verl/utils/device.py
++++ b/verl/utils/device.py
+@@ -78,12 +78,14 @@
+         str: Device type string ('cuda', 'npu', or 'cpu').
+     """
+     if is_cuda_available:
+-        device = "cuda"
+-    elif is_npu_available:
+-        device = "npu"
+-    else:
+-        device = "cpu"
+-    return device
++        return "cuda"
++    try:
++        import torch_npu
++        if torch.npu.is_available():
++            return "npu"
++    except ImportError:
++        pass
++    return "cpu"
+ 
+ 
+ def get_torch_device():
+diff --git a/verl/utils/distributed.py b/verl/utils/distributed.py
+--- a/verl/utils/distributed.py
++++ b/verl/utils/distributed.py
+@@ -155,13 +155,16 @@
+             master_listen_fd=listen_fd,
+         )
+ 
+-        return StatelessProcessGroup(
++        pg = StatelessProcessGroup(
+             rank=rank,
+             world_size=world_size,
+             store=store,
+-            socket=listen_socket,
+             data_expiration_seconds=data_expiration_seconds,
+         )
++        # keep the listen socket alive: this vLLM version's StatelessProcessGroup
++        # does not accept a `socket` field
++        pg._listen_socket = listen_socket
++        return pg
+ 
+     pg = create_process_group(host=master_address, port=master_port, rank=rank, world_size=world_size)
+ 
+diff --git a/verl/utils/megatron/router_replay_utils.py b/verl/utils/megatron/router_replay_utils.py
+--- a/verl/utils/megatron/router_replay_utils.py
++++ b/verl/utils/megatron/router_replay_utils.py
+@@ -489,6 +489,10 @@
+         Returns:
+             list: A contiguous sublist of RouterReplay.router_instances for the local layer range.
+         """
++        # No routers registered (e.g. router replay unsupported on NPU): stay inert.
++        # Avoids get_moe_num_layers_to_build() asserting on odd layer counts (e.g. 43 % PP != 0).
++        if not RouterReplay.router_instances:
++            return []
+         vp_size = tf_config.virtual_pipeline_model_parallel_size
+         if vp_size is not None:
+             vp_rank = 0 if vp_rank is None else vp_rank
+diff --git a/verl/utils/vllm/npu_vllm_patch.py b/verl/utils/vllm/npu_vllm_patch.py
+--- a/verl/utils/vllm/npu_vllm_patch.py
++++ b/verl/utils/vllm/npu_vllm_patch.py
+@@ -193,13 +193,16 @@
+     import vllm
+     from packaging import version
+ 
+-    _VLLM_VERSION = version.parse(vllm.__version__)
++    try:
++        _VLLM_VERSION = version.parse(vllm.__version__)
++    except:
++        _VLLM_VERSION = version.parse("0.23.0")
+     if _VLLM_VERSION >= version.parse("0.13.0") and _VLLM_VERSION <= version.parse("0.14.0"):
+         # Disable flash_attn in RotaryEmbedding (NPU) when VLLM >= 0.13
+         from vllm.model_executor.layers.fused_moe import FusedMoE
+ 
+         patch_vllm013_rotary_emb()
+-        FusedMoE.weight_loader = vllm_v013_weight_loader_method_wrapper(FusedMoE.weight_loader)
++        #FusedMoE.weight_loader = vllm_v013_weight_loader_method_wrapper(FusedMoE.weight_loader)
+ 
+     VERL_NPU_ENABLE_A2_PATCH_VLLM_ASCEND_MC2 = bool(int(os.getenv("VERL_NPU_ENABLE_A2_PATCH_VLLM_ASCEND_MC2", "1")))
+     if VERL_NPU_ENABLE_A2_PATCH_VLLM_ASCEND_MC2:
+diff --git a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+--- a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
++++ b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+@@ -137,6 +137,11 @@
+                     f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
+                     f"Please increase rollout.update_weights_bucket_megabytes({self.bucket_size_mb} MB)."
+                 )
++                if offset % 8 != 0 and "tid2eid" in name and weight.dtype == torch.int64:
++                    offset = (offset + 8 - 1) // 8 * 8
++
++                if offset % 4 != 0 and weight.dtype == torch.bfloat16:
++                    offset = (offset + 4 - 1) // 4 * 4
+                 bucket_meta[name] = {
+                     "name": name,
+                     "shape": weight.shape,
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -164,6 +164,15 @@
+             for k in VLLM_ASCEND_REQUIRED_ENV_VARS:
+                 if k not in os.environ:
+                     os.environ[k] = VLLM_ASCEND_REQUIRED_ENV_VARS[k]
++        # A2 + MC2 ops (e.g. MoeDistributeDispatch) are incompatible with
++        # HCCL_HOST/NPU_SOCKET_PORT_RANGE. verl constants_ppo.py injects them
++        # into all Ray workers; strip them inside vLLM worker processes.
++        if os.environ.get("VERL_VLLM_STRIP_HCCL_PORT_RANGE", "0") == "1":
++            # Only strip on old CANN where A2+MC2 is incompatible with PORT_RANGE.
++            # On CANN 9.1.0-beta.3 stripping leaves fixed port 16666 and any second
++            # HCCL comm on the same device fails with EADDRINUSE (error code 7).
++            os.environ.pop("HCCL_HOST_SOCKET_PORT_RANGE", None)
++            os.environ.pop("HCCL_NPU_SOCKET_PORT_RANGE", None)
+ 
+         instance = super().__new__(cls)
+         instance._is_qat_model = _is_qat_model
+@@ -207,6 +216,18 @@
+         elif use_standard_weight_load:
+             # Re-apply here because async IPC weight sync can happen long after init and lose MoE weight_loader attrs.
+             patch_vllm_moe_model_weight_loader(self.model_runner.model)
++            # vllm-ascend process_weights_after_loading transposes MoE w13/w2
++            # (transpose(1,2)) after the initial load. Revert to the pre-transpose
++            # layout once per update cycle so bucket loading follows the exact same
++            # path as startup; process_weights_after_loading (called after all
++            # buckets) re-transposes back.
++            for _layer in self.model_runner.model.model.layers:
++                _experts = getattr(getattr(_layer, "mlp", None), "experts", None)
++                if _experts is not None and hasattr(_experts, "w13_weight") and hasattr(_experts, "w2_weight"):
++                    # in-place .data assignment keeps the Parameter (and its
++                    # weight_loader attribute) intact
++                    _experts.w13_weight.data = _experts.w13_weight.data.transpose(1, 2).contiguous()
++                    _experts.w2_weight.data = _experts.w2_weight.data.transpose(1, 2).contiguous()
+ 
+         assert self.device is not None
+         receiver = BucketedWeightReceiver(

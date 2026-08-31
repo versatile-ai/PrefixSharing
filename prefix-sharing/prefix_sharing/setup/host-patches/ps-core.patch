@@ -1,0 +1,1116 @@
+# host-patches: ps-core.patch — PS 运行时必需(A 类 19 项)
+# 目标树:mindspeed_llm 99f7fc1d + verl 809f2d8f(镜像构建期 git apply)
+# dsa_indexer.py 段为 A+B+C 生产全形态:M3/M4/M7a/M6 与 A 类同 hunk 交错,
+# 物理上不可按行切分(见 ps-extra.patch 说明)。探针(PS_DEBUG/DSA-DBG 门控)保留,env 关闭零开销。
+# 实验件剥离:PS_SKIP_WEIGHT_SYNC/GRAD-DUAL/DUAL-PASS/WDUMP/PS_ROLLOUT_MODEL_PATH/VLLM_LAUNCH_ERROR。
+
+diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_llm/tasks/models/transformer/dsa_indexer.py
+--- a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py
++++ b/mindspeed_llm/tasks/models/transformer/dsa_indexer.py
+@@ -10,6 +10,7 @@
+ from functools import wraps
+ 
+ import torch_npu
++import traceback
+ 
+ from megatron.core import parallel_state
+ from megatron.training import get_args
+@@ -390,6 +391,7 @@
+                     zero_based=True,
+                     return_maxlen=True,
+                 )
++
+             else:
+                 cu_seqlens_q = cu_seqlens_k = None
+                 max_seqlen_q = max_seqlen_k = None
+@@ -422,21 +424,136 @@
+                     compress_ratio=compress_ratio,
+                 )
+             topk_idxs = torch.where(topk_idxs == -1, topk_idxs, topk_idxs + offset) if offset != 0 else topk_idxs
++            if __import__("os").environ.get("PS_DEBUG") == "1":
++                # [FUSED-PROBE] fused 分支值域判别(2026-08-23):
++                # per-row max(topk) vs 行号推导 s2IdLimit 阶梯(单段近似);
++                # == s2IdLimit 边界命中 = 非 fused 分支 Z1 修的契约差位;
++                # kernel 值守卫 >= s2IdLimit 拒槽 -> break -> NaN(FUSED-OUT 复检)
++                _t0 = topk_idxs
++                _r0 = _t0.shape[1]
++                _mx = _t0.max(dim=-1).values.reshape(-1)
++                _mn = _t0.min(dim=-1).values.reshape(-1)
++                _neg = (_t0 == -1).sum(dim=-1).reshape(-1)
++                _pos = (_t0 >= 0).sum(dim=-1).reshape(-1)
++                _j = torch.arange(_r0, device=_t0.device)
++                _lim = (_j + 1) // compress_ratio
++                _eq = (_mx == _lim).sum().item()
++                _ge = (_mx >= _lim).sum().item()
++                _mxv = _mx.max().item()
++                print(f"[PS_DEBUG] FUSED-PROBE rank={torch.distributed.get_rank()} flag={args.use_fused_lightning_indexer} r={compress_ratio} rows={_r0} topk={_t0.shape[0]} mn={_mn.min().item()} mx={_mxv} neg_tot={int(_neg.sum())} pos_tot={int(_pos.sum())} neg_max_row={int(_neg.max())} mx_eq_lim={_eq} mx_ge_lim={_ge}", flush=True)
++
+         else:
+             s1, s2 = x.size(0), k.size(0)
+             s_total = s2 * compress_ratio
+             end_pos = start_pos + s_total
+             device = x.device
+-            compress_idxs = DSAIndexer.get_compress_idxs_on_this_rank(s_total, device) // compress_ratio
++            # [PS-fix19] floor → ceil(与 fix12b/488 行统一):1-based 位置 x 的
++            # 窗口号 = ceil(x/ratio)。floor 把每窗口第 1 个位置(x=kr+1)整行
++            # 全遮、其余行缺自己窗口 → topk 后置 -1 过多 → 展开表欠填 →
++            # kernel 消费固定行数 → 尾部陈旧 → NaN。
++            _ci_fix19 = DSAIndexer.get_compress_idxs_on_this_rank(s_total, device)
++            compress_idxs = (_ci_fix19 + 1) // compress_ratio
+             index_score = bf16_index(q.contiguous(), weights.unsqueeze(-1), k.contiguous())
++            if __import__("os").environ.get("PS_DEBUG") == "1":
++                import torch as _tgi
++                _sn = int(_tgi.isnan(index_score).sum())
++                _qn = int(_tgi.isnan(q).sum())
++                _kn = int(_tgi.isnan(k).sum())
++                _wn = int(_tgi.isnan(weights).sum())
++                if _sn or _qn or _kn or _wn:
++                    print(f"[PS_DEBUG] IDXER-NAN rank={parallel_state.get_tensor_model_parallel_rank()} score_nan={_sn} q_nan={_qn} k_nan={_kn} w_nan={_wn} s1={s1} s2={s2}", flush=True)
+             if compress_idxs.size(0) != s1:
+                 compress_idxs = DSAIndexer._align_compress_idxs(compress_idxs, s1, s2, device)
+             mask = torch.arange(s2, device=device).repeat(s1, 1) >= compress_idxs  # (s1, s2)
++            _win_ub = None
++            if (packed_seq_params is not None
++                    and packed_seq_params.cu_seqlens_q is not None
++                    and packed_seq_params.cu_seqlens_kv is not None):
++                _cuq_m = packed_seq_params.cu_seqlens_q
++                _cuk_m = packed_seq_params.cu_seqlens_kv
++                if _cuq_m[0] != 0:
++                    _cuq_m = torch.cat((_cuq_m.new_zeros(1), _cuq_m))
++                if _cuk_m[0] != 0:
++                    _cuk_m = torch.cat((_cuk_m.new_zeros(1), _cuk_m))
++                _cp_m = parallel_state.get_context_parallel_world_size()
++                _tp_m = parallel_state.get_tensor_model_parallel_world_size()
++                # [PS-fix-cp2] 去掉 _cp_m == 1 门控:段内因果掩码+段相对换算对
++                # CP>1 同样必需(CP 分片下跨段全局索引撞段界 → kernel 0x2a 级联)。
++                if (torch.equal(_cuq_m, _cuk_m)
++                        and int(_cuq_m[-1]) % _tp_m == 0):
++                    # [PS-fix-seg-mask] stock 多段 packed:原 mask 是全局因果单阈值,
++                    # 段 2+ 行的候选窗口含段 1 的块 → top-512 被跨段竞争挤出 →
++                    # 段内有效项 < kernel 消费数 → 欠填 NaN。改段内因果掩码(屏蔽
++                    # 段外 + 段内窗口外),topk 后检查同步改用段内窗口上界。
++                    # PS 裁剪布局(cu_q!=cu_kv)不满足 equal,走原路径不受影响。
++                    # [EXACT-WIN] 用 TP rank×片长+片内行号反推精确全局行号(SP 连续分片),
++                    # 窗口 = (j+1)//ratio 精确值(上取整粗粒度会让 win_c 多 1 → 改变
++                    # kernel 消费边界行为)
++                    _tp_rank_m = parallel_state.get_tensor_model_parallel_rank()
++                    _tp_size_m = parallel_state.get_tensor_model_parallel_world_size()
++                    # [PS-fix-cp2] CP 布局是双块非连续:rank r 持有全局块
++                    # {r, 2*cp_size - r - 1}(kvallgather_context_parallel.py)。
++                    # TP 组对半映射到两个 chunk(chunk 0 = TP 前半,chunk 1 = TP 后半),
++                    # 行全局位置 = 所属全局块起点 + TP 组内偏移。
++                    _cp_rank_m = parallel_state.get_context_parallel_rank()
++                    _s_local_m = int(_cuq_m[-1]) // _cp_m
++                    _chunk_m = _s_local_m // 2
++                    _tp_per_chunk = _tp_size_m // 2
++                    _loc_chunk = 0 if _tp_rank_m < _tp_per_chunk else 1
++                    _off_m = (_tp_rank_m % _tp_per_chunk) * s1 + torch.arange(s1, device=device)
++                    _gpos = torch.clamp(
++                        (_cp_rank_m if _loc_chunk == 0 else 2 * _cp_m - _cp_rank_m - 1) * _chunk_m + _off_m,
++                        max=int(_cuq_m[-1]) - 1,
++                    ).unsqueeze(1)
++                    _seg_of = torch.searchsorted(_cuq_m, _gpos, right=True) - 1
++                    _seg_start = _cuq_m[_seg_of]
++                    # [PS-fix12b] floor→ceil 对齐 kernel deal 契约(peer automodelwire-97
++                    # 从 kernel 源码静态证实):kernel 每行消费
++                    # deal = min(ceil((j+1)/ratio), topk) 个 topk 槽
++                    # (aicpu (p+1)/r-1 + aicore (s1EndIdx+1)/r 均 ceil;vector 侧跳过
++                    # -1 槽 → merge 只填 floor 行 → cube 按 ceil 行读 → 尾部陈旧
++                    # → softmax NaN,毒行 = 864/2304 = 37.5% 定量吻合)。
++                    _win_c = (_gpos - _seg_start + 1) // compress_ratio
++                    # [PS-fix-cp2-fencepost] 段末行窗口上限 clamp 到段 cmp 行数:
++                    # fencepost 变体(+1 在 floor 外/ceil/1 索引)会给 idx == rows
++                    # 的恒 1 越界(kernel 契约 idx < rows);clamp 兜底所有变体。
++                    _seg_len_c = ((_cuq_m[1:] - _cuq_m[:-1]) // compress_ratio)[_seg_of]
++                    _win_c = torch.clamp(_win_c, min=torch.ones_like(_seg_len_c), max=_seg_len_c)
++                    _seg_start_c = _seg_start // compress_ratio
++                    _kc = torch.arange(s2, device=device).unsqueeze(0)
++                    mask = (_kc < _seg_start_c) | (_kc >= _seg_start_c + _win_c)
++                    _win_ub = _seg_start_c + _win_c
+             index_score = index_score + torch.where(mask, torch.finfo(q.dtype).min, 0)
+             topk_score, topk_idxs = index_score.topk(min(index_topk, end_pos // compress_ratio), dim=-1)
+             topk_idxs = topk_idxs.int()
+-            mask = topk_idxs >= compress_idxs
++            if __import__("os").environ.get("PS_DEBUG") == "1":
++                print(f"[PS_DEBUG] IDXER-BRANCH rank={torch.distributed.get_rank()} r={compress_ratio} exactwin={_win_ub is not None} cuq={list(_cuq_m.tolist()) if _win_ub is not None else None} cuk={list(_cuk_m.tolist()) if _win_ub is not None else None}", flush=True)
++            if _win_ub is not None:
++                # [Z1 已退役 2026-08-28] F1 落地(ceil -> floor+1)后窗口最大值 = N-1,
++                # 边界值(== s2IdLimit)不再进入 topk,Z1 兜底(边界槽换 0)失去存在意义。
++                # mask 改用 _win_ub(floor+1 后即 N 界;原 _win_floor 与之同值,删重)。
++                # 探针保留作 F1 生效验证(退役后 pred 应恒 0)。
++                if __import__("os").environ.get("PS_DEBUG") == "1":
++                    # [Z1-PROBE] F1 生效验证(退役探针):pred 应恒 0
++                    _win_floor = _seg_start_c + (_gpos - _seg_start + 1) // compress_ratio
++                    # [Z1-PROBE] 机制验证:每行边界值(==s2IdLimit)槽位 s* vs win
++                    _eqb = (topk_idxs == _win_floor).reshape(-1, topk_idxs.size(-1))
++                    _anyb = _eqb.any(dim=1)
++                    _sstar = _eqb.int().argmax(dim=1)
++                    _gp1 = _gpos.reshape(-1)
++                    _dl1 = _win_c.reshape(-1)
++                    _r1 = _gp1 % compress_ratio
++                    _pred = (_r1 != (compress_ratio - 1)) & _anyb & (_sstar < _dl1)
++                    print(f"[PS_DEBUG] Z1-PROBE rank={torch.distributed.get_rank()} r={compress_ratio} pred={int(_pred.sum())} rows={_gp1[_pred].tolist()[:60]} sstar={_sstar[_pred].tolist()[:60]} win={_dl1[_pred].tolist()[:60]}", flush=True)
++                mask = topk_idxs >= _win_ub
++            else:
++                mask = topk_idxs >= compress_idxs
+             topk_idxs = torch.where(mask, -1, topk_idxs + offset) if offset != 0 else torch.where(mask, -1, topk_idxs)
++            if _win_ub is not None:
++                # [DOMAIN-CONV] kernel 契约 = batch-relative(段内)+ 段前缀基址:
++                # topk 值必须减段压缩起点转段内域,否则 s2IdLimit=win 全拒(绕回原始 bug)。
++                topk_idxs = torch.where(topk_idxs >= 0, topk_idxs - _seg_start_c, topk_idxs)
++
+ 
+         return topk_idxs, topk_score
+ 
+@@ -461,15 +578,22 @@
+         weights = weights * self.softmax_scale
+         return q, k, weights, x
+ 
+-    def all_gather_qk_weight(self, q, k, weights):
+-        k = gather_from_sp_cp(k)
++    def all_gather_qk_weight(self, q, k, weights, k_is_global=False):
++        # [PS-fix] k 的 gather 按分支条件化:
++        #   TND (packed): compressor 内部已 gather 为全局压缩表 → 跳过 (k_is_global=True),
++        #    否则二次 gather 产生 TP 份重复 (Round34: 81x4=324 → topk=324 非法)。
++        #   BSND (padded): compressor 输出为每卡局部分片 → 必须 gather 拼装全局表。
++        if not k_is_global:
++            k = gather_from_sp_cp(k)
+         if self.use_fused_lightning_indexer:
+             q = gather_from_sp_cp(q)
+             weights = gather_from_sp_cp(weights)
+         return q, k, weights
+ 
+-    def all_gather_qk_weight_kvallgather(self, q, k, weights):
+-        k = gather_from_sp_cp(k)
++    def all_gather_qk_weight_kvallgather(self, q, k, weights, k_is_global=False):
++        # [PS-fix] 同上: k 的 gather 按分支条件化
++        if not k_is_global:
++            k = gather_from_sp_cp(k)
+         if self.use_fused_lightning_indexer:
+             group = parallel_state.get_tensor_model_parallel_group()
+             q = gather_from_sequence_parallel_region(q, group=group)
+@@ -1272,6 +1396,9 @@
+     for i, chunk_id in enumerate(local_seq_chunk_ids):
+         kv_len = chunk_id * chunk_size
+ 
++        if __import__("os").environ.get("PS_DEBUG") == "1":
++            _si = topk_indices[i]
++            print(f"[PS_DEBUG] SFA-CP-IDX rank={torch.distributed.get_rank()} i={i} chunk_id={chunk_id} kv_len={kv_len} idx_max={int(_si.max())} idx_ge_kvlen={bool((_si >= kv_len).any())} neg1={int((_si == -1).sum())}", flush=True)
+         attn_outs = torch_npu.npu_sparse_flash_attention(
+             q[i],
+             k_ag[:, :kv_len, ...],
+@@ -1318,6 +1445,13 @@
+     cmp_ratio,
+     packed_seq_params=None,
+ ):
++    if __import__("os").environ.get("PS_DEBUG") == "1":
++        _qsh = tuple(query.shape) if query is not None else None
++        _kva = tuple(ori_kv.shape) if ori_kv is not None else None
++        _csh = tuple(cmp_kv.shape) if cmp_kv is not None else None
++        _ish = tuple(cmp_sparse_indices.shape) if cmp_sparse_indices is not None else None
++        _frs = [f.name for f in traceback.extract_stack()[-4:-2]]
++        print(f"[PS_DEBUG] FUSED-IN rank={torch.distributed.get_rank()} ratio={cmp_ratio} qs={_qsh} kv={_kva} cmp={_csh} idx={_ish} grad={torch.is_grad_enabled()} frames={_frs}", flush=True)
+     from mindspeed_llm.ops.npu_sparse_flash_mla import npu_sparse_flash_mla
+ 
+     cp_size = parallel_state.get_context_parallel_world_size()
+@@ -1337,21 +1471,80 @@
+     k_chunks = [ori_kv[:end_idx_0, ...], ori_kv[:end_idx_1, ...]]
+ 
+     if cmp_kv is not None:
+-        chunk_size_cmp = chunk_size // cmp_ratio
+-
+-        end_idx_0_cmp = (cp_rank + 1) * chunk_size_cmp
+-        end_idx_1_cmp = (2 * cp_size - cp_rank) * chunk_size_cmp
++        # [PS-fix-cp2] 因果边界在 token 域定义再 floor 到 cmp 域:先 floor 再乘会因
++        # chunk_size//ratio 截断而恒短 1 行 → topk 选出 idx==切片行数 → kernel 拒绝 → NaN。
++        end_idx_0_cmp = ((cp_rank + 1) * chunk_size) // cmp_ratio
++        end_idx_1_cmp = ((2 * cp_size - cp_rank) * chunk_size) // cmp_ratio
+ 
+         cmp_k_chunks = [cmp_kv[:end_idx_0_cmp, ...], cmp_kv[:end_idx_1_cmp, ...]]
+     else:
+         cmp_k_chunks = [None, None]
+ 
+     layout = 'TND' if packed_seq_params is not None else 'BSND'
+-    cu_seqlens_q = packed_seq_params.cu_seqlens_q if packed_seq_params else None
+-    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv if packed_seq_params else None
++    cu_seqlens_q_full = packed_seq_params.cu_seqlens_q if packed_seq_params else None
++    cu_seqlens_kv_full = packed_seq_params.cu_seqlens_kv if packed_seq_params else None
+ 
+     outputs = []
+     for i in range(2):
++        # [PS-fix-cp2-cu] 每个 chunk 调用只传本 chunk 的 cu 区间(边界对齐 0):
++        # 全量 cu 下 kernel 会按全量行号索引 chunk 内行 → OOB → NaN(层级探针
++        # 实证:layer1 ratio0 层出口 NaN)。q 侧 = chunk 行区间;kv 侧 = kv 切片区间。
++        if cu_seqlens_q_full is not None:
++            # 段与 chunk 行区间的交集重编号(chunk 起点对齐 0):
++            # 每段的 [max(start,q0)-q0, min(end,q1)-q0] 作为局部段边界。
++            _q0 = i * chunk_size
++            _q1 = _q0 + chunk_size
++            _seg_q = cu_seqlens_q_full
++            _s0 = torch.clamp(_seg_q[:-1], min=_q0, max=_q1) - _q0
++            _s1 = torch.clamp(_seg_q[1:], min=_q0, max=_q1) - _q0
++            _keep = (_seg_q[1:] > _q0) & (_seg_q[:-1] < _q1)
++            if _keep.any():
++                cu_seqlens_q = torch.cat([_s0[_keep], _s1[_keep][-1:]])
++            else:
++                cu_seqlens_q = None
++        else:
++            cu_seqlens_q = None
++        if cu_seqlens_kv_full is not None:
++            _kv_len = k_chunks[i].shape[0]
++            cu_seqlens_kv = torch.tensor(
++                [0, _kv_len],
++                device=cu_seqlens_kv_full.device,
++                dtype=cu_seqlens_kv_full.dtype,
++            )
++        else:
++            cu_seqlens_kv = None
++        # [PS-dualpass-fix] q 段数 != kv 段数(kv 按设计恒单段 [0,kv_len] 前缀;off pass
++        # PS=0 未 trim 布局下 packed 多 sample × CP 切片横跨 sample 边界 → q 多段 →
++        # has_ori_kv 的 bsz 防御检查崩 EZ1001,实证 job 31000000 step3)。折叠 q 为单段:
++        # 行号连续、idx 行号不变、ori 窗口(±127)按行号局部 → 与 PS-on trim 单段同款
++        # 布局语义(20 步长训全绿实证 on 形态无崩);off 基线与 on 布局同构,测量更干净。
++        if cu_seqlens_q is not None and cu_seqlens_kv is not None:
++            if (cu_seqlens_q.numel() - 1) != (cu_seqlens_kv.numel() - 1):
++                # [PS-dualpass-fix] q 段数 != kv 段数(kv 按设计恒单段 [0,kv_len] 前缀;off pass
++                # PS=0 未 trim 布局下 packed 多 sample × CP 切片横跨 sample 边界 → q 多段 →
++                # has_ori_kv 的 bsz 防御检查崩 EZ1001,实证 job 31000000 step3)。折叠 q 为单段:
++                # 行号连续、idx 行号不变、ori 窗口(±127)按行号局部 → 与 PS-on trim 单段同款
++                # 布局语义(20 步长训全绿实证 on 形态无崩;on 趟 packing 亦多样本
++                # offsets=[0,2304,2688] 实证 → 两侧泄漏同构);off 基线与 on 布局同构,测量公平。
++                # 泄漏足迹:非首段行数/总行数(cmp 全因果域中段 2 行与段 1 交叉的量级,peer 判读预案)。
++                _fold_rows = int(q_chunks[i].shape[0] - (cu_seqlens_q[1] - cu_seqlens_q[0]))
++                if __import__("os").environ.get("PS_DEBUG") == "1":
++                    print(f"[PS_DEBUG] CU-FOLD rank={torch.distributed.get_rank()} i={i} fold_rows={_fold_rows} tot={q_chunks[i].shape[0]} ratio={_fold_rows / q_chunks[i].shape[0]:.4f}", flush=True)
++                cu_seqlens_q = torch.tensor(
++                    [0, q_chunks[i].shape[0]],
++                    device=cu_seqlens_q.device,
++                    dtype=cu_seqlens_q.dtype,
++                )
++        if __import__("os").environ.get("PS_DEBUG") == "1":
++            _ic = indices_chunks[i]
++            _ck = cmp_k_chunks[i]
++            _m = int(_ic.max()) if _ic is not None else -1
++            _cl = _ck.shape[0] if _ck is not None else -1
++            _oob = bool((_ic >= _cl).any()) if _ic is not None else False
++            _oobn = int((_ic >= _cl).sum()) if (_ic is not None and _cl > 0) else -1
++            _negn = int((_ic < 0).sum()) if _ic is not None else -1
++            _tot = int(_ic.numel()) if _ic is not None else -1
++            print(f"[PS_DEBUG] MLA-CP-IDX rank={torch.distributed.get_rank()} i={i} cmp_rows={_cl} idx_max={_m} oob={_oob} oob_n={_oobn} neg_n={_negn} tot={_tot} cu_q={cu_seqlens_q.tolist() if cu_seqlens_q is not None else None} cu_kv={cu_seqlens_kv.tolist() if cu_seqlens_kv is not None else None} kv_rows={k_chunks[i].shape[0]}", flush=True)
+         out = npu_sparse_flash_mla(
+             q_chunks[i],
+             k_chunks[i],
+@@ -1368,6 +1561,45 @@
+         outputs.append(out)
+ 
+     output = torch.cat(outputs, dim=0)
++
++    if __import__("os").environ.get("PS_DEBUG") == "1":
++        # [PS-inp-ni] 融合算子输入 NaN/±inf 分计:q 与输出 1:1 对齐,
++        # kv/cmp_kv 全表行号——判别机制在上游 expand/gather 还是 fused 内部。
++        # v7: 补 cmp_kv(sparse 内容源)探针——merge 捞起 [0,win) 行,此前盲区。
++        _qi22 = query.detach().float()
++        _qnr22 = _qi22.isnan().any(dim=(1, 2, 3)).nonzero().flatten().tolist()
++        _qir22 = _qi22.isinf().any(dim=(1, 2, 3)).nonzero().flatten().tolist()
++        _qp22 = int((_qi22.isinf() & (_qi22 > 0)).sum().item())
++        _qn22 = int((_qi22.isinf() & (_qi22 < 0)).sum().item())
++        _ki22 = ori_kv.detach().float()
++        _knr22 = _ki22.isnan().any(dim=1).nonzero().flatten().tolist()
++        _kir22 = _ki22.isinf().any(dim=1).nonzero().flatten().tolist()
++        _knc22 = int(_ki22.isnan().sum().item())
++        _kic22 = int(_ki22.isinf().sum().item())
++        if cmp_kv is not None:
++            _cki22 = cmp_kv.detach().float()
++            _cknr22 = _cki22.isnan().any(dim=1).nonzero().flatten().tolist()
++            _ckir22 = _cki22.isinf().any(dim=1).nonzero().flatten().tolist()
++            _cknc22 = int(_cki22.isnan().sum().item())
++        else:
++            _cknr22 = _ckir22 = []
++            _cknc22 = -1
++        print(f"[PS_DEBUG] FUSED-IN-NI rank={torch.distributed.get_rank()} "
++              f"ratio={cmp_ratio} qnan={len(_qnr22)} qrows={_qnr22[:60]} qinf={len(_qir22)} qinfrows={_qir22[:60]} qpinfs={_qp22} qninfs={_qn22} "
++              f"kvnan={len(_knr22)} kvrows={_knr22[:60]} kvinf={len(_kir22)} kvinfrows={_kir22[:60]} kvnanc={_knc22} kvinfc={_kic22} "
++              f"cknan={len(_cknr22)} ckrows={_cknr22[:60]} ckinf={len(_ckir22)} ckinfrows={_ckir22[:60]} cknanc={_cknc22} ckshape={tuple(cmp_kv.shape) if cmp_kv is not None else None}", flush=True)
++    if __import__("os").environ.get("PS_DEBUG") == "1":
++        _o = output.detach().float()
++        _nrow = int(_o.isnan().any(dim=(1, 2, 3)).sum())
++        _infn22 = int((~torch.isfinite(_o)).any(dim=(1, 2, 3)).sum()) - _nrow
++        _oip22 = int((_o.isinf() & (_o > 0)).sum().item())
++        _oin22 = int((_o.isinf() & (_o < 0)).sum().item())
++        _nblk = _o.isnan().any(dim=(1, 2, 3)).reshape(-1, 64).sum(dim=1) \
++            .int().tolist() if _o.shape[0] % 64 == 0 else []
++        # [PS-fix22] bad 行号(前 40 个):直接验证 win∈[249,425) 毒带假设。
++        _bad_idx = _o.isnan().any(dim=(1, 2, 3)).nonzero(as_tuple=False) \
++            .flatten().tolist()[:40] if _nrow > 0 else []
++        print(f"[PS_DEBUG] FUSED-OUT rank={torch.distributed.get_rank()} ratio={cmp_ratio} nan={int(_o.isnan().sum())} bad_rows={_nrow} bad_idx={_bad_idx} inf={_infn22} oip={_oip22} oin={_oin22} blk64={_nblk} max={_o.max().item():.3e} min={_o.min().item():.3e} shape={tuple(output.shape)}", flush=True)
+ 
+     return output
+ 
+@@ -1556,9 +1788,9 @@
+     k_chunks = [ori_kv[:end_idx_0, ...], ori_kv[:end_idx_1, ...]]
+ 
+     if cmp_kv is not None:
+-        chunk_size_cmp = chunk_size // cmp_ratio
+-        end_idx_0_cmp = (cp_rank + 1) * chunk_size_cmp
+-        end_idx_1_cmp = (2 * cp_size - cp_rank) * chunk_size_cmp
++        # [PS-fix-cp2] 同上:token 域先求边界再 floor,cmp 切片不短行。
++        end_idx_0_cmp = ((cp_rank + 1) * chunk_size) // cmp_ratio
++        end_idx_1_cmp = ((2 * cp_size - cp_rank) * chunk_size) // cmp_ratio
+         cmp_k_chunks = [cmp_kv[:end_idx_0_cmp, ...], cmp_kv[:end_idx_1_cmp, ...]]
+     else:
+         cmp_k_chunks = [None, None]
+@@ -1573,6 +1805,37 @@
+ 
+     outputs = []
+     for i in range(2):
++        # [PS-fix-cp2-cu-B] 同步 kernel A 的 fix2(per-chunk cu 切片,边界对齐 0):
++        # 全量 cu 直传 → kernel 按全量行号索引 chunk 内行 → OOB → NaN
++        # (实证:L3 训练态出口全量 NaN,而 A 修 fix2 后 L1 ratio0 层干净)。
++        # q 侧 = 段交集重编号;kv 侧 = kv 切片区间;cmp_kv 侧 = 局部 q cu 重映射
++        # (与 g2_attention 调用处 get_cmp_cu_seqlens 同一公式)。
++        if cu_seqlens_q is not None:
++            _q0 = i * chunk_size
++            _q1 = _q0 + chunk_size
++            _seg_q = cu_seqlens_q
++            _s0 = torch.clamp(_seg_q[:-1], min=_q0, max=_q1) - _q0
++            _s1 = torch.clamp(_seg_q[1:], min=_q0, max=_q1) - _q0
++            _keep = (_seg_q[1:] > _q0) & (_seg_q[:-1] < _q1)
++            if _keep.any():
++                cu_seqlens_q_i = torch.cat([_s0[_keep], _s1[_keep][-1:]])
++            else:
++                cu_seqlens_q_i = None
++        else:
++            cu_seqlens_q_i = None
++        if cu_seqlens_kv is not None:
++            _kv_len = k_chunks[i].shape[0]
++            cu_seqlens_kv_i = torch.tensor(
++                [0, _kv_len],
++                device=cu_seqlens_kv.device,
++                dtype=cu_seqlens_kv.dtype,
++            )
++        else:
++            cu_seqlens_kv_i = None
++        if cu_seqlens_cmp_kv is not None and cu_seqlens_q_i is not None:
++            cu_seqlens_cmp_kv_i, _ = get_cmp_cu_seqlens(cu_seqlens_q_i, cmp_ratio, zero_based=True)
++        else:
++            cu_seqlens_cmp_kv_i = None
+         out = npu_sparse_flash_mla_with_indexer_loss(
+             q_chunks[i],
+             k_chunks[i],
+@@ -1588,9 +1851,9 @@
+             loss_coeff=loss_coeff,
+             layout_q=layout_q,
+             layout_kv=layout_kv,
+-            cu_seqlens_q=cu_seqlens_q,
+-            cu_seqlens_kv=cu_seqlens_kv,
+-            cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
++            cu_seqlens_q=cu_seqlens_q_i,
++            cu_seqlens_kv=cu_seqlens_kv_i,
++            cu_seqlens_cmp_kv=cu_seqlens_cmp_kv_i,
+         )
+         outputs.append(out)
+ 
+diff --git a/mindspeed_llm/ops/npu_sparse_flash_mla.py b/mindspeed_llm/ops/npu_sparse_flash_mla.py
+--- a/mindspeed_llm/ops/npu_sparse_flash_mla.py
++++ b/mindspeed_llm/ops/npu_sparse_flash_mla.py
+@@ -454,7 +454,8 @@
+         cu_seqlens_q = cu_seqlens_q.int()
+         cu_seqlens_kv = cu_seqlens_kv.int()
+         cmp_residual_kv = cmp_residual_kv.int() if cmp_residual_kv is not None else None
+-        cu_seqlens_cmp_kv, _ = get_cmp_cu_seqlens(cu_seqlens_q, cmp_ratio, zero_based=True)
++        # [PS-fix4] 压缩 KV 的 cu_seqlens 必须从 KV 侧推导:PS 裁剪下 Q 侧被裁剪(如 [2304,384])而 KV 侧保持全量(如 [2304,2304]),Q 侧推导会得到错误的 cmp 表范围(如 [0,576,672] vs 真实 [0,576,1152]),导致 reuser 查询映射到错误 KV 区段 → NaN。正常 packed 场景下 Q/KV 结构一致,无行为变化。
++        cu_seqlens_cmp_kv, _ = get_cmp_cu_seqlens(cu_seqlens_kv, cmp_ratio, zero_based=True)
+         if cu_seqlens_q[0] != 0:
+             cu_seqlens_q = torch.cat((cu_seqlens_q.new_zeros(1), cu_seqlens_q))
+             cu_seqlens_kv = torch.cat((cu_seqlens_kv.new_zeros(1), cu_seqlens_kv))
+diff --git a/mindspeed_llm/tasks/models/transformer/deepseek4/compressor.py b/mindspeed_llm/tasks/models/transformer/deepseek4/compressor.py
+--- a/mindspeed_llm/tasks/models/transformer/deepseek4/compressor.py
++++ b/mindspeed_llm/tasks/models/transformer/deepseek4/compressor.py
+@@ -122,6 +122,13 @@
+ 
+         kv = gather_from_sp_cp(kv)
+         score = gather_from_sp_cp(score)
++
++        # [PS-fix] kv 被 gather 到全局域后, freqs 表必须同步 gather:
++        # SP 下 kv 由局部 81/576 行聚合成全局 324/2304 行, 而传入的 freqs 仍是局部表,
++        # 用全局 cu_seqlens 按 ratio 切窗时被钳位, 与压缩块数错配 (Round33: 81块 vs 21行)。
++        # 带形状守卫: 调用方传局部表(现行为)或全局表均可正确处理; SP=1 时为 no-op。
++        if freqs_cis.shape[0] != kv.shape[0]:
++            freqs_cis = gather_from_sp_cp(freqs_cis.unsqueeze(1)).squeeze(1)
+ 
+         tensor_list_kv = []
+         tensor_list_score = []
+diff --git a/mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention_kernel.py b/mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention_kernel.py
+--- a/mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention_kernel.py
++++ b/mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention_kernel.py
+@@ -2,6 +2,7 @@
+ from dataclasses import dataclass
+ from typing import Optional
+ 
++import triton.language as tl
+ import torch
+ from torch import nn
+ import torch_npu
+diff --git a/mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention.py b/mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention.py
+--- a/mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention.py
++++ b/mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention.py
+@@ -430,7 +430,8 @@
+                     packed_seq_params,
+                 )
+                 query_index, key_index, weights = self.indexer.all_gather_qk_weight_kvallgather(
+-                    query_index, key_index, weights
++                    query_index, key_index, weights,
++                    k_is_global=packed_seq_params is not None,
+                 )
+                 # Fuse LILossTrain includes LIG
+                 dsa_indexer_context = torch.no_grad() if args.use_fused_lightning_indexer_loss else nullcontext()
+@@ -473,7 +474,11 @@
+             if (
+                 kv_compress := self.compressor(hidden_states, start_pos, local_freqs_cis, packed_seq_params)
+             ) is not None:
+-                if self.config.sequence_parallel or self.kv_allgather:
++                # [PS-fix] 按分支条件化:
++                #   TND (packed): compressor 内部已 gather 为全局压缩表 → 跳过,
++                #    否则二次 gather 产生 TP 份重复 (cmp_kv 被 4 份复制)。
++                #   BSND (padded): 输出为每卡局部分片 → 保留 gather 拼装全局表。
++                if packed_seq_params is None and (self.config.sequence_parallel or self.kv_allgather):
+                     kv_compress = gather_from_sp_cp(kv_compress)
+ 
+         self.attn_sink = self.attn_sink.to(hidden_states.device)
+diff --git a/mindspeed_llm/pretrain_deepseek4.py b/mindspeed_llm/pretrain_deepseek4.py
+new file mode 100644
+--- /dev/null
++++ b/mindspeed_llm/pretrain_deepseek4.py
+@@ -0,0 +1,308 @@
++# Copyright (c) 2023, HUAWEI CORPORATION.  All rights reserved.
++# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
++"""Pretrain GPT."""
++
++import os
++from functools import partial
++from typing import Union
++
++import torch
++from mindspeed_llm import megatron_adaptor
++from megatron.training import get_args
++from megatron.training import print_rank_0
++from megatron.training import get_timers
++from megatron.training import get_tokenizer
++from megatron.core import mpu, tensor_parallel
++from megatron.core.enums import ModelType
++from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
++from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
++from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
++from megatron.core.datasets.utils import get_blend_from_list
++from megatron.core.rerun_state_machine import get_rerun_state_machine
++import megatron.legacy.model
++from mindspeed_llm.training.training import pretrain
++from megatron.core.transformer.spec_utils import import_module
++from megatron.training.utils import (
++    get_batch_on_this_cp_rank,
++    get_batch_on_this_tp_rank,
++    average_losses_across_data_parallel_group
++)
++from megatron.training.arguments import core_transformer_config_from_args
++from megatron.training.yaml_arguments import core_transformer_config_from_yaml
++from megatron.core.models.gpt.gpt_layer_specs import (
++    get_gpt_layer_local_spec,
++    get_gpt_layer_with_transformer_engine_spec,
++    get_gpt_mtp_block_spec,
++)
++from mindspeed_llm.core.models.deepseek4.deepseek4_model import DeepSeek4Model
++from mindspeed_llm.tasks.models.transformer.deepseek4.mhc.mhc import get_mhc_spec
++from mindspeed_llm.training.utils import  set_mtp_batch_list, get_mtp_batch_list
++from mindspeed_llm.core.transformer.multi_token_prediction import generate_mtp_batch_list_on_this_tp_rank
++
++
++def model_provider(pre_process=True, post_process=True, use_dualpipe_mtp=False) -> Union[DeepSeek4Model, megatron.legacy.model.GPTModel]:
++    """Builds the model.
++
++    If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model.
++
++    Args:
++        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
++        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
++
++
++    Returns:
++        Union[DeepSeek4Model, megatron.legacy.model.DeepSeek4Model]: The returned model
++    """
++    args = get_args()
++    use_te = args.transformer_impl == "transformer_engine"
++
++    print_rank_0('building GPT model ...')
++    # Experimental loading arguments from yaml
++    if args.yaml_cfg is not None:
++        config = core_transformer_config_from_yaml(args, "language_model")
++    else:
++        config = core_transformer_config_from_args(args)
++
++    if not args.use_legacy_models:
++        if args.spec is not None:
++            transformer_layer_spec = import_module(args.spec)
++        else:
++            if use_te:
++                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm)
++            else:
++                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm)
++        mtp_block_spec = None
++        if args.mtp_num_layers is not None:
++            if args.mtp_spec is not None:
++                mtp_layer_spec = import_module(args.mtp_spec)
++            else:
++                mtp_layer_spec = transformer_layer_spec
++            mtp_block_spec = get_gpt_mtp_block_spec(config, mtp_layer_spec, use_transformer_engine=use_te)
++            if use_dualpipe_mtp:
++                post_process = True
++
++        hc_head_spec = get_mhc_spec(args.enable_mhc)
++
++        model = DeepSeek4Model(
++            config=config,
++            transformer_layer_spec=transformer_layer_spec,
++            vocab_size=args.padded_vocab_size,
++            max_sequence_length=args.max_position_embeddings,
++            pre_process=pre_process,
++            post_process=post_process,
++            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
++            parallel_output=True,
++            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
++            position_embedding_type=args.position_embedding_type,
++            rotary_percent=args.rotary_percent,
++            rotary_base=args.rotary_base,
++            rope_scaling=args.use_rope_scaling,
++            mtp_block_spec=mtp_block_spec,
++            hc_head_spec=hc_head_spec
++        )
++    else:
++        raise ValueError("DeepSeek4 model is only supported with Megatron Core!")
++
++    return model
++
++
++def get_batch(data_iterator):
++    """Generate a batch."""
++
++    args = get_args()
++
++    is_middle_stage = not (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage())
++    pretrain_not_tnd_flags = not args.is_instruction_dataset and not args.reset_attention_mask
++    if pretrain_not_tnd_flags and is_middle_stage:
++        return (None,) * 5
++
++    # get batches based on the TP rank you are on
++    batch = get_batch_on_this_tp_rank(data_iterator)
++
++    if args.return_document_ids and mpu.get_context_parallel_rank() == 0 and mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_pipeline_model_parallel_rank() == 0:
++        print("current idx: {}, current rank: {}, data_parallel_rank: {}, document_ids: {}".format(batch['idx'], torch.distributed.get_rank(), mpu.get_data_parallel_rank(), batch['document_ids']))
++        batch.pop('document_ids', None)
++        batch.pop('idx', None)
++
++    # get batch_list for mtp_block
++    if args.mtp_num_layers:
++        mtp_batch_list = generate_mtp_batch_list_on_this_tp_rank(batch)
++        set_mtp_batch_list(mtp_batch_list)
++
++    # slice batch along sequence dimension for context parallelism
++    batch = get_batch_on_this_cp_rank(batch)
++    return batch.values()
++
++
++# define spiky loss as a loss that's 10x the max loss observed
++SPIKY_LOSS_FACTOR = 10
++
++
++def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
++    """Loss function.
++
++    Args:
++        loss_mask (torch.Tensor): Used to mask out some portions of the loss
++        output_tensor (torch.Tensor): The tensor with the losses
++
++    Returns:
++        the loss scalar for this micro-batch
++        the number of non-padded tokens in this microbatch
++        a dict containing reporting metrics on the loss and number of tokens across
++            the data parallel ranks
++    """
++    args = get_args()
++
++    losses = output_tensor.float()
++    loss_mask = loss_mask.view(-1).float()
++    total_tokens = loss_mask.sum()
++    loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
++
++    if args.context_parallel_size > 1:
++        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
++
++    # Check individual rank losses are not NaN prior to DP all-reduce.
++    rerun_state_machine = get_rerun_state_machine()
++    if args.check_for_nan_in_loss_and_grad:
++        rerun_state_machine.validate_result(
++            result=loss[0],
++            rejection_func=torch.isnan,
++            message="found NaN in local forward loss calculation",
++            tolerance=0.0,        # forward pass calculations are determinisic
++            fatal=True,
++        )
++        rerun_state_machine.validate_result(
++            result=loss[0],
++            rejection_func=torch.isinf,
++            message="found Inf in local forward loss calculation",
++            tolerance=0.0,        # forward pass calculations are determinisic
++            fatal=True,
++        )
++    # Check for spiky loss
++    if args.check_for_spiky_loss:
++        rerun_state_machine.validate_result(
++            result=loss[0],
++            rejection_func=partial(
++                rerun_state_machine.is_unexpectedly_large,
++                threshold=SPIKY_LOSS_FACTOR,
++                context="loss",
++            ),
++            message="Spiky loss",
++            tolerance=0.0,        # forward pass calculations are determinisic
++            fatal=False,
++        )
++    # Reduce loss for logging.
++    reporting_loss = loss.clone().detach()
++    try:
++        if args.enable_elastic_training:
++            from mindspeed_llm.core.high_availability import elastic_training_common
++            if not elastic_training_common.zit_scale_in_running_state():
++                torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
++        else:
++            torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
++    except Exception:
++        torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
++
++    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
++    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
++    # on loss[0] fixes this
++    local_num_tokens = loss[1].clone().detach().to(torch.int)
++    return (
++        loss[0].clone(),
++        local_num_tokens,
++        {'lm loss': (reporting_loss[0], reporting_loss[1])},
++    )
++
++
++def forward_step(data_iterator, model: DeepSeek4Model):
++    """Forward training step.
++
++    Args:
++        data_iterator : Input data iterator
++        model (DeepSeek4Model): The GPT Model
++    """
++    args = get_args()
++    timers = get_timers()
++
++    # Get the batch.
++    timers('batch-generator', log_level=2).start()
++    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
++        data_iterator)
++    timers('batch-generator').stop()
++
++    if args.use_legacy_models:
++        output_tensor = model(tokens, position_ids, attention_mask,
++                              labels=labels)
++    else:
++        output_tensor = model(tokens, position_ids, attention_mask,
++                              labels=labels, loss_mask=loss_mask)
++
++    return output_tensor, partial(loss_func, loss_mask)
++
++
++def is_dataset_built_on_rank():
++    return mpu.get_tensor_model_parallel_rank() == 0
++
++
++def core_gpt_dataset_config_from_args(args):
++    tokenizer = get_tokenizer()
++
++    return GPTDatasetConfig(
++        random_seed=args.seed,
++        sequence_length=args.seq_length,
++        blend=get_blend_from_list(args.data_path),
++        blend_per_split=[
++            get_blend_from_list(args.train_data_path),
++            get_blend_from_list(args.valid_data_path),
++            get_blend_from_list(args.test_data_path)
++        ],
++        split=args.split,
++        path_to_cache=args.data_cache_path,
++        mmap_bin_files=args.mmap_bin_files,
++        tokenizer=tokenizer,
++        reset_position_ids=args.reset_position_ids,
++        reset_attention_mask=args.reset_attention_mask,
++        eod_mask_loss=args.eod_mask_loss,
++        create_attention_mask=args.create_attention_mask_in_dataloader,
++    )
++
++
++def train_valid_test_datasets_provider(train_val_test_num_samples):
++    """Build the train test and validation datasets.
++
++    Args:
++        train_val_test_num_samples : A list containing the number of samples in train test and validation.
++    """
++    args = get_args()
++
++    config = core_gpt_dataset_config_from_args(args)
++
++    if config.mock:
++        dataset_type = MockGPTDataset
++    else:
++        dataset_type = GPTDataset
++    print_rank_0("> building train, validation, and test datasets for GPT ...")
++
++    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
++        dataset_type,
++        train_val_test_num_samples,
++        is_dataset_built_on_rank,
++        config
++    ).build()
++
++    print_rank_0("> finished creating GPT datasets ...")
++
++    return train_ds, valid_ds, test_ds
++
++
++def main():
++    # Temporary for transition to core datasets
++    train_valid_test_datasets_provider.is_distributed = True
++    pretrain(train_valid_test_datasets_provider,
++             model_provider,
++             ModelType.encoder_or_decoder,
++             forward_step)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/verl/models/mcore/model_forward.py b/verl/models/mcore/model_forward.py
+--- a/verl/models/mcore/model_forward.py
++++ b/verl/models/mcore/model_forward.py
+@@ -16,12 +16,14 @@
+ from typing import Optional
+ 
+ import torch
++import os
+ from torch.nested._internal.nested_tensor import NestedTensor
+ 
+ from verl.utils.megatron_utils import unwrap_model
+ from verl.workers.config import MtpConfig
+ 
+ from .util import (
++
+     build_vlm_attn_mask_bshd,
+     build_vlm_attn_mask_thd,
+     postprocess_bshd,
+@@ -288,18 +290,28 @@
+             packed_seq_params=packed_seq_params,
+             **model_kwargs,
+         )
++        if os.environ.get("PS_DEBUG") == "1":
++            print(f"[DSA-DBG] post-forward input_ids offsets={input_ids.offsets().tolist()} ids_ptr={input_ids.offsets().data_ptr()}", flush=True)
++        for _k, _v in logits_processor_args.items():
++            _o = _v.offsets().tolist() if hasattr(_v, "offsets") else None
++            _p = _v.offsets().data_ptr() if hasattr(_v, "offsets") else None
++            if os.environ.get("PS_DEBUG") == "1":
++                print(f"[DSA-DBG] post-forward lpa[{_k}] offsets={_o} ptr={_p}", flush=True)
+ 
+         if post_process and logits_processor is not None:
+-            args = {
+-                k: preprocess_thd_engine(
++            args = {}
++            for k, v in logits_processor_args.items():
++                _o = v.offsets().tolist() if hasattr(v, "offsets") else None
++                _p = v.offsets().data_ptr() if hasattr(v, "offsets") else None
++                if os.environ.get("PS_DEBUG") == "1":
++                    print(f"[DSA-DBG] lpa-preprocess[{k}] offsets={_o} ptr={_p} ids_offsets={input_ids.offsets().tolist()}", flush=True)
++                args[k] = preprocess_thd_engine(
+                     v,
+                     pre_process=True,
+                     need_roll=(k == "label"),
+                     use_fp8_padding=use_fp8_padding,
+                     local_cp_size=local_cp_size,
+                 )[0]
+-                for k, v in logits_processor_args.items()
+-            }
+             output_dict = logits_processor(output_orig, **args)
+             output = {
+                 k: postprocess_thd_engine(
+diff --git a/verl/models/mcore/util.py b/verl/models/mcore/util.py
+--- a/verl/models/mcore/util.py
++++ b/verl/models/mcore/util.py
+@@ -386,6 +386,13 @@
+             if cp_size <= 1:
+                 seqlen = seqlens_in_batch_cpu[i]
+                 start_idx = cu_seqlens_padded_cpu[i]
++                try:
++                    _o = input_ids.offsets().tolist()
++                    if os.environ.get("PS_DEBUG") == "1":
++                        print(f"[DSA-DBG] preprocess_thd input_ids offsets={_o} values={input_ids.values().shape[0]} batch_size={batch_size} seqlens={seqlens_in_batch.tolist()} offsets_ptr={input_ids.offsets().data_ptr()} values_ptr={input_ids.values().data_ptr()}", flush=True)
++                except Exception as _e:
++                    if os.environ.get("PS_DEBUG") == "1":
++                        print(f"[DSA-DBG] preprocess_thd print failed: {_e}", flush=True)
+                 input_ids_rmpad[start_idx : start_idx + seqlen] = input_ids[i]
+                 # Build position_ids: 0, 1, 2, ..., seqlen-1 for this sequence
+                 position_ids_rmpad[start_idx : start_idx + seqlen] = torch.arange(
+@@ -567,6 +574,10 @@
+     batch_size = input_ids.shape[0]
+     seqlens_in_batch = input_ids.offsets().diff()
+     max_seqlen = seqlens_in_batch.max().item()
++    align_value = 2048
++    if max_seqlen % align_value != 0:
++        old_seqlen = max_seqlen
++        max_seqlen = ((max_seqlen + align_value - 1) // align_value) * align_value
+     tp_size = mpu.get_tensor_model_parallel_world_size()
+     # For CP, sequence length must be divisible by (2 * cp_size), and for SP by tp_size.
+     align_size = math.lcm(tp_size, 2 * cp_size) if cp_size > 1 else tp_size
+diff --git a/verl/trainer/config/engine/mindspeed.yaml b/verl/trainer/config/engine/mindspeed.yaml
+--- a/verl/trainer/config/engine/mindspeed.yaml
++++ b/verl/trainer/config/engine/mindspeed.yaml
+@@ -4,42 +4,6 @@
+ # mindspeed_llm or mindspeed_mm
+ strategy: mindspeed_llm
+ 
+-llm_kwargs:
+-  # mindspeed_llm model config
+-  use_mcore_models: true
+-  spec: []
+-  qk_layernorm: true
+-  position_embedding_type: rope
+-  normalization: RMSNorm
+-  disable_bias_linear: true
+-  swiglu: true
+-  attention_softmax_in_fp32: true  
+-  no_gradient_accumulation_fusion: true
+-  group_query_attention: true
+-
+-  # only support transformer_engine for now
+-  transformer_impl: transformer_engine
+-
+-  no_pad_to_seq_lengths: true
+-  reset_attention_mask: true
+-  context_parallel_algo: ulysses_cp_algo
+-  attention_mask_type: general
+-
+-  # mindspeed_llm optimizer config
+-  use_flash_attn: true
+-  use_fused_rotary_pos_emb: true
+-  sequence_parallel: true
+-  use_rotary_position_embeddings: true
+-  use_fused_swiglu: true
+-  use_fused_rmsnorm: true
+-  no_masked_softmax_fusion: true
+-  use_distributed_optimizer: true
+-
+-  # mindspeed_llm train config
+-  seq_length: 10240
+-  micro_batch_size: 1
+-  initial_loss_scale: 4096
+-  init_method_std: 0.01
+-  hidden_dropout: 0.0
++llm_kwargs: {}
+ 
+ mm_kwargs: {}
+diff --git a/verl/utils/torch_functional.py b/verl/utils/torch_functional.py
+--- a/verl/utils/torch_functional.py
++++ b/verl/utils/torch_functional.py
+@@ -1000,7 +1000,9 @@
+     offsets = nested_tensor.offsets()
+     seqlens = offsets.diff()
+     output = torch.repeat_interleave(tensor, seqlens, dim=0)
+-    output = torch.nested.nested_tensor_from_jagged(values=output, offsets=offsets)
++    # [PS-fix5] clone offsets: 不复用输入 nested tensor 的 offsets buffer,
++    # 否则下游对输出(如 temperature)的原地操作会污染原始 batch 的 offsets。
++    output = torch.nested.nested_tensor_from_jagged(values=output, offsets=offsets.clone())
+     return output
+ 
+ 
+diff --git a/verl/utils/vllm/patch.py b/verl/utils/vllm/patch.py
+--- a/verl/utils/vllm/patch.py
++++ b/verl/utils/vllm/patch.py
+@@ -21,6 +21,12 @@
+ 
+     SUPPORTED_MOE_MODELS.append(DeepseekV2ForCausalLM)
+     SUPPORTED_MOE_MODELS.append(DeepseekV3ForCausalLM)
++except ImportError:
++    pass
++
++try:
++    from vllm.model_executor.models.deepseek_v4 import DeepseekV4ForCausalLM
++    SUPPORTED_MOE_MODELS.append(DeepseekV4ForCausalLM)
+ except ImportError:
+     pass
+ 
+@@ -118,7 +124,8 @@
+         raise ValueError("The provided model does not have a valid 'model' or 'language_model' attribute.")
+ 
+     if not isinstance(model, tuple(SUPPORTED_MOE_MODELS)) and not isinstance(inner_model, tuple(SUPPORTED_MOE_MODELS)):
+-        return
++        print(f"Warning! The model is not in SUPPORTED_MOE_MODELS{SUPPORTED_MOE_MODELS}")
++        #return
+ 
+     # TODO(@leisuzz): class Qwen3MoeLLMForCausalLM is not available if VLLM version < 0.11.0,
+     # will update the 'if statement' with 'isinstance' when verl commonly use VLLM version >= 0.11.0
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -843,7 +843,14 @@
+             set_router_replay_data(layers_topk_idx, None, self.tf_config, vp_rank)
+ 
+         if pad_mode == DatasetPadMode.NO_PADDING:
+-            label = input_ids.clone()
++            # [PS-fix5] label 与 input_ids 彻底断开存储共享(nested clone 会共享 offsets;
++            # restore 会原地写 label 的 prefix-last 位置,共享 values 也会污染 batch)。
++            label = torch.nested.nested_tensor_from_jagged(
++                values=input_ids.values().clone(),
++                offsets=input_ids.offsets().clone(),
++            )
++            if os.environ.get("PS_DEBUG") == "1":
++                print(f"[DSA-DBG] label-clone offsets={label.offsets().tolist()} label_ptr={label.offsets().data_ptr()} ids_ptr={input_ids.offsets().data_ptr()}", flush=True)
+         else:
+             raise NotImplementedError(f"Pad mode {pad_mode} is not supported for megatron engine")
+ 
+@@ -868,6 +875,11 @@
+             from verl.models.mcore import get_mcore_forward_fused_model_engine_fn
+ 
+             fused_forward_fn = get_mcore_forward_fused_model_engine_fn(self.model_config.hf_config)
++            import torch as _tg
++            _off_snapshot = input_ids.offsets().clone()
++            _off_ptr = input_ids.offsets().data_ptr()
++            if os.environ.get("PS_DEBUG") == "1":
++                print(f"[DSA-DBG] guard: pre-forward offsets={input_ids.offsets().tolist()} ptr={_off_ptr}", flush=True)
+             output = fused_forward_fn(
+                 model=model,
+                 input_ids=input_ids,
+@@ -877,6 +889,14 @@
+                 calculate_entropy=calculate_entropy,
+                 pad_token_id=self.model_config.tokenizer.pad_token_id,
+             )
++            _cur = input_ids.offsets().tolist()
++            _snap = _off_snapshot.tolist()
++            if _cur != _snap:
++                if os.environ.get("PS_DEBUG") == "1":
++                    print(f"[DSA-DBG] guard: CORRUPTED after fused forward! before={_snap} after={_cur} ptr={_off_ptr}", flush=True)
++            else:
++                if os.environ.get("PS_DEBUG") == "1":
++                    print(f"[DSA-DBG] guard: clean after fused forward ptr={_off_ptr}", flush=True)
+         else:
+             if not isinstance(temperature, torch.Tensor):
+                 temperature = torch.tensor([temperature] * input_ids.shape[0], device=input_ids.device)
+@@ -884,6 +904,8 @@
+             temperature = temperature.to(torch.float32)
+             assert temperature.shape[0] == input_ids.shape[0]
+             temperature = verl_F.expand_as_nested(temperature, input_ids)  # (bsz, j1)
++            if os.environ.get("PS_DEBUG") == "1":
++                print(f"[DSA-DBG] expand-nested temp offsets={temperature.offsets().tolist()} temp_ptr={temperature.offsets().data_ptr()} ids_ptr={input_ids.offsets().data_ptr()}", flush=True)
+             from verl.models.mcore import get_mcore_engine_forward_fn
+ 
+             forward_fn = get_mcore_engine_forward_fn(self.model_config.hf_config)
+@@ -895,6 +917,9 @@
+                 temperature[temperature <= 0] = 1e-8
+                 assert torch.all(temperature > 0).item(), f"temperature tensor must be positive. Got {temperature}"
+                 logits.div_(temperature.unsqueeze(dim=-1).to(logits.dtype))
++                if __import__("os").environ.get("PS_DEBUG") == "1":
++                    _l = logits.detach().float()
++                    print(f"[PS_DEBUG] FWD-LOGITS-E nan={int(_l.isnan().sum())} pinf={int(_l.isposinf().sum())} ninf={int(_l.isneginf().sum())} max={_l.max().item():.3e} min={_l.min().item():.3e}", flush=True)
+                 ret = {}
+                 if calculate_entropy:
+                     logits_bak = logits.clone()
+@@ -914,6 +939,19 @@
+                 if distillation_use_topk:
+                     ret.update(logits_processor_func(student_logits=logits_bak, data=batch, data_format=data_format))
+                 log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
++                if __import__("os").environ.get("PS_DEBUG") == "1":
++                    _lpe = log_probs.detach().float()
++                    print(f"[PS_DEBUG] FWD-LOGPROBS-E nan={int(_lpe.isnan().sum())} pinf={int(_lpe.isposinf().sum())} ninf={int(_lpe.isneginf().sum())} max={_lpe.max().item():.3e} min={_lpe.min().item():.3e}", flush=True)
++                    def _lp_hook(_g):
++                        print(f"[PS_DEBUG] DLOGPROBS-PROBE nan={int(_g.isnan().sum())}", flush=True)
++                        return _g
++                    def _lg_hook(_g):
++                        print(f"[PS_DEBUG] DLOGITS-PROBE nan={int(_g.isnan().sum())}", flush=True)
++                        return _g
++                    if log_probs.requires_grad:
++                        log_probs.register_hook(_lp_hook)
++                    if logits_bak.requires_grad:
++                        logits_bak.register_hook(_lg_hook)
+                 ret["log_probs"] = log_probs
+                 return ret
+ 
+diff --git a/verl/workers/engine/mindspeed/transformer_impl.py b/verl/workers/engine/mindspeed/transformer_impl.py
+--- a/verl/workers/engine/mindspeed/transformer_impl.py
++++ b/verl/workers/engine/mindspeed/transformer_impl.py
+@@ -93,15 +93,14 @@
+         import torch.distributed
+         from megatron.core.enums import ModelType
+         from megatron.training.training import get_model
+-
++        from mindspeed_llm.pretrain_deepseek4 import model_provider
++        gpt_model_provider=model_provider
+         # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
+         if self.engine_config.forward_only:
+-            module = get_model(gpt_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False)
+-            return module
+-
++            module = get_model(gpt_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False)      
+         module = get_model(gpt_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=True)
+         if self.vanilla_bridge:
+-            self.bridge.load_weights(module, self.model_config.local_path)
++            self.bridge.load_weights(module, self.model_config.local_path,memory_efficient=True)
+         else:
+             raise ValueError(f"vanilla_bridge should be true now, but got {self.vanilla_bridge}")
+ 
+diff --git a/verl/workers/engine/mindspeed/utils.py b/verl/workers/engine/mindspeed/utils.py
+--- a/verl/workers/engine/mindspeed/utils.py
++++ b/verl/workers/engine/mindspeed/utils.py
+@@ -153,10 +153,11 @@
+ 
+ 
+ def apply_patch(model_config, engine_config, optimizer_config):
+-    model_config = get_base_mcore_config_from_model_config(model_config)
+-    optimizer_config = get_base_mcore_config_from_optim_config(optimizer_config)
++    # model_config = get_base_mcore_config_from_model_config(model_config)
++    # optimizer_config = get_base_mcore_config_from_optim_config(optimizer_config)
+     engine_config = get_base_mcore_config_from_engine_config(engine_config)
+-    all_config = {**model_config, **optimizer_config, **engine_config}
++    #all_config = {**model_config, **optimizer_config, **engine_config}
++    all_config = {**engine_config}
+     mcore_config = add_mcore_arguments(all_config)
+     from mindspeed_llm.tasks.megatron_adaptor_v2 import repatch
+ 
+diff --git a/verl/workers/actor/megatron_actor.py b/verl/workers/actor/megatron_actor.py
+--- a/verl/workers/actor/megatron_actor.py
++++ b/verl/workers/actor/megatron_actor.py
+@@ -439,6 +439,8 @@
+ 
+         indices = None
+         temperature = data.meta_info["temperature"]
++        if __import__("os").environ.get("PS_DEBUG") == "1":
++            print(f"[PS_DEBUG] FWD-TEMP-A temp={temperature}", flush=True)
+         if use_dynamic_bsz:
+             assert max_token_len is not None, "max_token_len must be set when use_dynamic_bsz is True"
+             dp_group = mpu.get_data_parallel_group()
+@@ -655,6 +657,9 @@
+                     assert logits.shape[:2] == label.shape[:2]
+                     assert label.shape == label_mask.shape
+                     logits.div_(temperature)
++                    if __import__("os").environ.get("PS_DEBUG") == "1":
++                        _l = logits.detach().float()
++                        print(f"[PS_DEBUG] FWD-LOGITS-A nan={int(_l.isnan().sum())} pinf={int(_l.isposinf().sum())} ninf={int(_l.isneginf().sum())} max={_l.max().item():.3e} min={_l.min().item():.3e}", flush=True)
+                     ret = {}
+                     if calculate_entropy:
+                         logits_bak = logits.clone()
+@@ -670,6 +675,9 @@
+                         logits_bak = logits
+                     log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
+                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
++                    if __import__("os").environ.get("PS_DEBUG") == "1":
++                        _lp = log_probs.detach().float()
++                        print(f"[PS_DEBUG] FWD-LOGPROBS-A nan={int(_lp.isnan().sum())} pinf={int(_lp.isposinf().sum())} ninf={int(_lp.isneginf().sum())} max={_lp.max().item():.3e} min={_lp.min().item():.3e}", flush=True)
+                     ret["log_probs"] = log_probs
+                     return ret
+ 

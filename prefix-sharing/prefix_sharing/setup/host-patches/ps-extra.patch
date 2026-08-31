@@ -1,0 +1,9 @@
+# host-patches: ps-extra.patch — B/C 类归属参考件(无可独立应用 hunk)
+# B 类: M3 宿主 forward all_gather k_is_global / M4 kv_compress gather 条件化 / M7a fix19 floor+1
+# C 类: M6 空白行对齐
+# 以上与 A 类(M7b-M7f、M8-M11)同文件同 hunk 交错:golden_dsa_indexer.diff 的
+# h2(A 类 EXACT-WIN/seg-mask/cp2/fencepost/Z1 退役/DOMAIN-CONV)内嵌 M7a,
+# h3 同时含 M3/M4(双方法条件化签名)与 M8 的 all_gather_qk_weight_kvallgather —
+# 无法按行/按 hunk 切分。结论:ps-core.patch 内 dsa_indexer.py 段即为全形态(A+B+C),
+# 本件为说明性参考;分类细则见 host-patches-spec.md。
+
