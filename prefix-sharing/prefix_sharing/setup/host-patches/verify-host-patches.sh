@@ -211,7 +211,7 @@ apply_one() {  # $1=树根 $2=补丁 $3=标签
     fi
   fi
 }
-# ps-core 复合补丁:同文件含 mindspeed_llm/*(5)与 verl/*(9),单侧 checkout 承受不了
+# ps-core 复合补丁:同文件含 mindspeed_llm/*(6)与 verl/*(9),单侧 checkout 承受不了
 # (缺域目录即报错;verl/mindspeed_llm 软链只服务 PYTHONPATH)。按域切片后分别 apply。
 if slice_patch "$BUNDLE_DIR/ps-core.patch"; then
   apply_one "$MS_ROOT" "$SLICE_MS" "MS ps-core"
