@@ -106,7 +106,7 @@ diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
 diff --git a/verl/utils/device.py b/verl/utils/device.py
 --- a/verl/utils/device.py
 +++ b/verl/utils/device.py
-@@ -78,12 +78,14 @@
+@@ -78,12 +78,10 @@
          str: Device type string ('cuda', 'npu', or 'cpu').
      """
      if is_cuda_available:
@@ -117,15 +117,11 @@ diff --git a/verl/utils/device.py b/verl/utils/device.py
 -        device = "cpu"
 -    return device
 +        return "cuda"
-+    try:
-+        import torch_npu
-+        if torch.npu.is_available():
-+            return "npu"
-+    except ImportError:
-+        pass
++    if is_npu_available:
++        return "npu"
 +    return "cpu"
- 
- 
+
+
  def get_torch_device():
 diff --git a/verl/utils/distributed.py b/verl/utils/distributed.py
 --- a/verl/utils/distributed.py

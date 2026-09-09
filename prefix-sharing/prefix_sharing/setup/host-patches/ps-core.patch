@@ -15,15 +15,21 @@ diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_l
  
  from megatron.core import parallel_state
  from megatron.training import get_args
-@@ -390,6 +391,7 @@
+@@ -390,6 +391,13 @@
                      zero_based=True,
                      return_maxlen=True,
                  )
++                # [topk-clamp] 下界 clamp(TND):批次内任一序列压缩块数 < index_topk
++                # → kernel 统一 K = min(index_topk, available) < 512 → EZ1001;
++                # 降级返回 None(与 non-fused 同契约)。cu_seqlens_k 已是压缩后
++                # zero-based 前缀和,相邻差即各序列压缩块数。
++                if (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).min().item() < index_topk:
++                    return None, None
 +
              else:
                  cu_seqlens_q = cu_seqlens_k = None
                  max_seqlen_q = max_seqlen_k = None
-@@ -422,21 +424,136 @@
+@@ -422,22 +430,148 @@
                      compress_ratio=compress_ratio,
                  )
              topk_idxs = torch.where(topk_idxs == -1, topk_idxs, topk_idxs + offset) if offset != 0 else topk_idxs
@@ -49,6 +55,11 @@ diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_l
              s1, s2 = x.size(0), k.size(0)
              s_total = s2 * compress_ratio
              end_pos = start_pos + s_total
++            # [topk-clamp] 下界 clamp(生产治本):压缩后 KV 块数 < index_topk(512)
++            # → kernel 合约 cmp_topk ∈ {0,512,1024} 不满足 → 直接降级返回 None,
++            # 由 g2_attention 走无压缩路径(cmp_ratio=0 → kernel 规范化 1 + cmp_kv=None)。
++            if end_pos // compress_ratio < index_topk:
++                return None, None
              device = x.device
 -            compress_idxs = DSAIndexer.get_compress_idxs_on_this_rank(s_total, device) // compress_ratio
 +            # [PS-fix19] floor → ceil(与 fix12b/488 行统一):1-based 位置 x 的
@@ -107,7 +118,7 @@ diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_l
 +                    _off_m = (_tp_rank_m % _tp_per_chunk) * s1 + torch.arange(s1, device=device)
 +                    _gpos = torch.clamp(
 +                        (_cp_rank_m if _loc_chunk == 0 else 2 * _cp_m - _cp_rank_m - 1) * _chunk_m + _off_m,
-+                        max=int(_cuq_m[-1]) - 1,
++                        max=int(_cuq_m[-1]) * _cp_m - 1,
 +                    ).unsqueeze(1)
 +                    _seg_of = torch.searchsorted(_cuq_m, _gpos, right=True) - 1
 +                    _seg_start = _cuq_m[_seg_of]
@@ -117,7 +128,7 @@ diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_l
 +                    # (aicpu (p+1)/r-1 + aicore (s1EndIdx+1)/r 均 ceil;vector 侧跳过
 +                    # -1 槽 → merge 只填 floor 行 → cube 按 ceil 行读 → 尾部陈旧
 +                    # → softmax NaN,毒行 = 864/2304 = 37.5% 定量吻合)。
-+                    _win_c = (_gpos - _seg_start + 1) // compress_ratio
++                    _win_c = (_gpos - _seg_start) // compress_ratio + 1
 +                    # [PS-fix-cp2-fencepost] 段末行窗口上限 clamp 到段 cmp 行数:
 +                    # fencepost 变体(+1 在 floor 外/ceil/1 索引)会给 idx == rows
 +                    # 的恒 1 越界(kernel 契约 idx < rows);clamp 兜底所有变体。
@@ -140,7 +151,7 @@ diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_l
 +                # 探针保留作 F1 生效验证(退役后 pred 应恒 0)。
 +                if __import__("os").environ.get("PS_DEBUG") == "1":
 +                    # [Z1-PROBE] F1 生效验证(退役探针):pred 应恒 0
-+                    _win_floor = _seg_start_c + (_gpos - _seg_start + 1) // compress_ratio
++                    _win_floor = _seg_start_c + (_gpos - _seg_start) // compress_ratio + 1
 +                    # [Z1-PROBE] 机制验证:每行边界值(==s2IdLimit)槽位 s* vs win
 +                    _eqb = (topk_idxs == _win_floor).reshape(-1, topk_idxs.size(-1))
 +                    _anyb = _eqb.any(dim=1)
@@ -150,19 +161,27 @@ diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_l
 +                    _r1 = _gp1 % compress_ratio
 +                    _pred = (_r1 != (compress_ratio - 1)) & _anyb & (_sstar < _dl1)
 +                    print(f"[PS_DEBUG] Z1-PROBE rank={torch.distributed.get_rank()} r={compress_ratio} pred={int(_pred.sum())} rows={_gp1[_pred].tolist()[:60]} sstar={_sstar[_pred].tolist()[:60]} win={_dl1[_pred].tolist()[:60]}", flush=True)
-+                mask = topk_idxs >= _win_ub
++                # [Z1-re] kernel guard >= s2IdLimit=floor rejects idx==floor;
++                # _win_ub=floor+1 leaves those through — tighten by 1.
++                mask = topk_idxs >= _win_ub - 1
 +            else:
 +                mask = topk_idxs >= compress_idxs
              topk_idxs = torch.where(mask, -1, topk_idxs + offset) if offset != 0 else torch.where(mask, -1, topk_idxs)
+-
 +            if _win_ub is not None:
 +                # [DOMAIN-CONV] kernel 契约 = batch-relative(段内)+ 段前缀基址:
 +                # topk 值必须减段压缩起点转段内域,否则 s2IdLimit=win 全拒(绕回原始 bug)。
-+                topk_idxs = torch.where(topk_idxs >= 0, topk_idxs - _seg_start_c, topk_idxs)
++                topk_idxs = torch.where(topk_idxs >= 0, topk_idxs - _seg_start_c, torch.zeros_like(topk_idxs))
 +
- 
++
++        # [topk-clamp] 统一兜底:任何路径算出的实际 K < index_topk 一律降级
++        # (fused BSND 等无前置检查的路径由这里兜住)。
++        if topk_idxs.shape[-1] < index_topk:
++            return None, None
          return topk_idxs, topk_score
  
-@@ -461,15 +578,22 @@
+     def forward_with_index_compress(
+@@ -461,15 +595,22 @@
          weights = weights * self.softmax_scale
          return q, k, weights, x
  
@@ -189,7 +208,7 @@ diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_l
          if self.use_fused_lightning_indexer:
              group = parallel_state.get_tensor_model_parallel_group()
              q = gather_from_sequence_parallel_region(q, group=group)
-@@ -1272,6 +1396,9 @@
+@@ -1272,6 +1413,9 @@
      for i, chunk_id in enumerate(local_seq_chunk_ids):
          kv_len = chunk_id * chunk_size
  
@@ -199,7 +218,7 @@ diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_l
          attn_outs = torch_npu.npu_sparse_flash_attention(
              q[i],
              k_ag[:, :kv_len, ...],
-@@ -1318,6 +1445,13 @@
+@@ -1318,6 +1462,13 @@
      cmp_ratio,
      packed_seq_params=None,
  ):
@@ -213,7 +232,7 @@ diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_l
      from mindspeed_llm.ops.npu_sparse_flash_mla import npu_sparse_flash_mla
  
      cp_size = parallel_state.get_context_parallel_world_size()
-@@ -1337,21 +1471,80 @@
+@@ -1337,26 +1488,88 @@
      k_chunks = [ori_kv[:end_idx_0, ...], ori_kv[:end_idx_1, ...]]
  
      if cmp_kv is not None:
@@ -297,10 +316,19 @@ diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_l
 +            _negn = int((_ic < 0).sum()) if _ic is not None else -1
 +            _tot = int(_ic.numel()) if _ic is not None else -1
 +            print(f"[PS_DEBUG] MLA-CP-IDX rank={torch.distributed.get_rank()} i={i} cmp_rows={_cl} idx_max={_m} oob={_oob} oob_n={_oobn} neg_n={_negn} tot={_tot} cu_q={cu_seqlens_q.tolist() if cu_seqlens_q is not None else None} cu_kv={cu_seqlens_kv.tolist() if cu_seqlens_kv is not None else None} kv_rows={k_chunks[i].shape[0]}", flush=True)
++        _idx_i = indices_chunks[i]
++        if _idx_i is not None:
++            _idx_i = _idx_i.clamp(min=0)
          out = npu_sparse_flash_mla(
              q_chunks[i],
              k_chunks[i],
-@@ -1368,6 +1561,45 @@
+             cmp_k_chunks[i],
+-            indices_chunks[i],
++            _idx_i,
+             sinks=sinks.float(),
+             softmax_scale=softmax_scale,
+             cmp_ratio=cmp_ratio,
+@@ -1368,6 +1581,45 @@
          outputs.append(out)
  
      output = torch.cat(outputs, dim=0)
@@ -346,7 +374,7 @@ diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_l
  
      return output
  
-@@ -1556,9 +1788,9 @@
+@@ -1556,9 +1808,9 @@
      k_chunks = [ori_kv[:end_idx_0, ...], ori_kv[:end_idx_1, ...]]
  
      if cmp_kv is not None:
@@ -359,7 +387,7 @@ diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_l
          cmp_k_chunks = [cmp_kv[:end_idx_0_cmp, ...], cmp_kv[:end_idx_1_cmp, ...]]
      else:
          cmp_k_chunks = [None, None]
-@@ -1573,6 +1805,37 @@
+@@ -1573,11 +1825,45 @@
  
      outputs = []
      for i in range(2):
@@ -394,10 +422,19 @@ diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_l
 +            cu_seqlens_cmp_kv_i, _ = get_cmp_cu_seqlens(cu_seqlens_q_i, cmp_ratio, zero_based=True)
 +        else:
 +            cu_seqlens_cmp_kv_i = None
++        _idx_il = indices_chunks[i]
++        if _idx_il is not None:
++            _idx_il = _idx_il.clamp(min=0)
          out = npu_sparse_flash_mla_with_indexer_loss(
              q_chunks[i],
              k_chunks[i],
-@@ -1588,9 +1851,9 @@
+             cmp_k_chunks[i],
+-            indices_chunks[i],
++            _idx_il,
+             q_idx_chunks[i],
+             k_idx_chunks[i],
+             w_chunks[i],
+@@ -1588,9 +1874,9 @@
              loss_coeff=loss_coeff,
              layout_q=layout_q,
              layout_kv=layout_kv,
@@ -413,7 +450,80 @@ diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_l
 diff --git a/mindspeed_llm/ops/npu_sparse_flash_mla.py b/mindspeed_llm/ops/npu_sparse_flash_mla.py
 --- a/mindspeed_llm/ops/npu_sparse_flash_mla.py
 +++ b/mindspeed_llm/ops/npu_sparse_flash_mla.py
-@@ -454,7 +454,8 @@
+@@ -143,6 +143,7 @@
+         ori_win_right: int,
+         layout_q: str,
+         layout_kv: str,
++        pad_mask: torch.Tensor,
+     ):
+         K = cmp_sparse_indices.shape[-1] if cmp_ratio == 4 else 0
+         has_cmp = cmp_kv is not None
+@@ -231,6 +232,19 @@
+             return_softmax_lse=True,
+         )
+ 
++        # [BSND-pad-fix] 源级 clean：pad 行的 result 和 lse 归零
++        # SFA kernel 对 BSND pad 行无 mask/seqused → 产 NaN；归零后 backward kernel
++        # 拿到的 saved result/lse 在 pad 行全 clean → 阻断 NaN 经 dKV 累加扩散到实行为
++        if pad_mask is not None:
++            result[pad_mask] = 0.0
++            # softmax_lse: [B, 1, S, *] — S 在 dim2，需广播为 [B, 1, S, 1] 再 masked_fill
++            softmax_lse.masked_fill_(pad_mask[:, None, :, None], 0.0)
++            ctx.seqused_q = ctx.seqused_ori_kv = None
++            ctx.seqused_cmp_kv = None
++        else:
++            ctx.seqused_q = ctx.seqused_ori_kv = None
++            ctx.seqused_cmp_kv = None
++
+         ctx.save_for_backward(
+             q,
+             ori_kv,
+@@ -259,6 +273,7 @@
+         ctx.max_seqlen_ori_kv = max_seqlen_kv
+         ctx.max_seqlen_cmp_kv = max_seqlen_cmp_kv
+         ctx.mark_non_differentiable(softmax_lse)
++        ctx.pad_mask = pad_mask
+ 
+         return result
+ 
+@@ -363,6 +378,20 @@
+             layout_kv=ctx.layout_kv,
+         )
+ 
++        # [BSND-pad-fix] backward: pad 行梯度归零
++        pad_mask = ctx.pad_mask
++        if pad_mask is not None:
++            dq[pad_mask] = 0.0
++            dori_kv[pad_mask] = 0.0
++            # has_cmp=False 的层 dcmp_kv 是 (0,) 1D 空张量，不能按 4D 索引
++            if dcmp_kv is not None and dcmp_kv.ndim == 4:
++                S = pad_mask.shape[1]
++                S_cmp = dcmp_kv.shape[1]
++                pm_cmp = pad_mask[:, :S_cmp * ctx.cmp_ratio].reshape(
++                    pad_mask.shape[0], S_cmp, ctx.cmp_ratio
++                ).all(dim=-1)
++                dcmp_kv[pm_cmp] = 0.0
++
+         # ori/cmp_softmax_l1 are the attn_softmax_out for the kl_div side loss; export them via
+         # an external channel (kl is computed outside this Function, not returned through autograd).
+ 
+@@ -386,6 +415,7 @@
+             None,  # ori_win_right
+             None,  # layout_q
+             None,  # layout_kv
++            None,  # pad_mask
+         )
+ 
+ 
+@@ -409,6 +439,7 @@
+     cu_seqlens_q: Optional[torch.Tensor] = None,
+     cu_seqlens_kv: Optional[torch.Tensor] = None,
+     cmp_residual_kv: Optional[torch.Tensor] = None,
++    pad_mask: Optional[torch.Tensor] = None,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     """Sparse shared-KV attention (forward + backward).
+ 
+@@ -454,7 +485,8 @@
          cu_seqlens_q = cu_seqlens_q.int()
          cu_seqlens_kv = cu_seqlens_kv.int()
          cmp_residual_kv = cmp_residual_kv.int() if cmp_residual_kv is not None else None
@@ -423,6 +533,14 @@ diff --git a/mindspeed_llm/ops/npu_sparse_flash_mla.py b/mindspeed_llm/ops/npu_s
          if cu_seqlens_q[0] != 0:
              cu_seqlens_q = torch.cat((cu_seqlens_q.new_zeros(1), cu_seqlens_q))
              cu_seqlens_kv = torch.cat((cu_seqlens_kv.new_zeros(1), cu_seqlens_kv))
+@@ -488,6 +520,7 @@
+         ori_win_right,
+         layout_q,
+         layout_kv,
++        pad_mask,
+     )
+ 
+     if layout_q == "TND":  # varlen FA
 diff --git a/mindspeed_llm/tasks/models/transformer/deepseek4/compressor.py b/mindspeed_llm/tasks/models/transformer/deepseek4/compressor.py
 --- a/mindspeed_llm/tasks/models/transformer/deepseek4/compressor.py
 +++ b/mindspeed_llm/tasks/models/transformer/deepseek4/compressor.py
@@ -454,7 +572,42 @@ diff --git a/mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention_kerne
 diff --git a/mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention.py b/mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention.py
 --- a/mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention.py
 +++ b/mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention.py
-@@ -430,7 +430,8 @@
+@@ -245,7 +245,13 @@
+         cmp_ratio,
+         q_len_global,
+         packed_seq_params,
++        pad_mask=None,
+     ):
++        # [topk-clamp] 降级契约:cmp_sparse_indices=None → 无压缩路径。
++        # cmp_ratio=0 由 npu_sparse_flash_mla 规范化为 1 → K=0 合法
++        # (kernel 合约 hasCmpKv=false 时不校验 cmpRatio)。
++        if cmp_sparse_indices is None:
++            cmp_ratio = 0
+         if self.use_sparse_flash_attn:
+             if self.kv_allgather:
+                 output = fused_sparse_attn_shared_kv_kvallgather(
+@@ -267,6 +273,7 @@
+                     layout_kv=layout,
+                     cu_seqlens_q=cu_seqlens_q,
+                     cu_seqlens_kv=cu_seqlens_kv,
++                    pad_mask=pad_mask,
+                 )
+         else:
+             _, bsz, _, _ = query.shape
+@@ -417,6 +424,12 @@
+         if self.config.sequence_parallel or self.kv_allgather:
+             kv = gather_from_sp_cp(kv)
+ 
++        # [BSND-pad-fix] BSND 模式从 attention_mask 提取 pad 行标记
++        # 必须在 generate_sparse_mask_compress 覆写 attention_mask 之前取
++        pad_mask = None
++        if packed_seq_params is None and attention_mask is not None:
++            pad_mask = attention_mask[:, 0, :, :].max(dim=-1).values < 0  # [B, S]
++
+         # get kv compress topk idxs
+         compress_topk_idxs = None
+         if self.compress_ratio > 1:
+@@ -430,7 +443,8 @@
                      packed_seq_params,
                  )
                  query_index, key_index, weights = self.indexer.all_gather_qk_weight_kvallgather(
@@ -464,7 +617,28 @@ diff --git a/mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention.py b/
                  )
                  # Fuse LILossTrain includes LIG
                  dsa_indexer_context = torch.no_grad() if args.use_fused_lightning_indexer_loss else nullcontext()
-@@ -473,7 +474,11 @@
+@@ -447,10 +461,11 @@
+                         offset,
+                         self.indexer.compress_ratio,
+                     )
+-                    compress_topk_idxs, compress_topk_score = self.indexer.post_process_index(
+-                        compress_topk_idxs, compress_topk_score
+-                    )
+-                if not args.use_fused_lightning_indexer_loss:
++                    if compress_topk_idxs is not None:
++                        compress_topk_idxs, compress_topk_score = self.indexer.post_process_index(
++                            compress_topk_idxs, compress_topk_score
++                        )
++                if not args.use_fused_lightning_indexer_loss and compress_topk_idxs is not None:
+                     b, s1, _ = compress_topk_idxs.size()
+                     s2 = key_index.size(0)
+                     attention_mask = self.indexer.generate_sparse_mask_compress(
+@@ -469,11 +484,15 @@
+ 
+         # get kv compress
+         kv_compress = None
+-        if self.compress_ratio > 1:
++        if self.compress_ratio > 1 and compress_topk_idxs is not None:
              if (
                  kv_compress := self.compressor(hidden_states, start_pos, local_freqs_cis, packed_seq_params)
              ) is not None:
@@ -477,6 +651,29 @@ diff --git a/mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention.py b/
                      kv_compress = gather_from_sp_cp(kv_compress)
  
          self.attn_sink = self.attn_sink.to(hidden_states.device)
+@@ -483,6 +502,7 @@
+             and args.use_g2_indexer_loss
+             and torch.is_grad_enabled()
+             and args.use_fused_lightning_indexer_loss
++            and compress_topk_idxs is not None
+         )
+         if use_smla_with_slig:
+             o = self.sparse_attention_with_indexer_loss(
+@@ -510,12 +530,14 @@
+                 self.compress_ratio,
+                 q_len_global,
+                 packed_seq_params,
++                pad_mask=pad_mask,
+             )
+             if (
+                 args.use_g2_indexer_loss
+                 and self.compress_ratio > 1
+                 and self.indexer is not None
+                 and torch.is_grad_enabled()
++                and compress_topk_idxs is not None
+             ):
+                 compress_topk_idxs = (
+                     torch.where(compress_topk_idxs == -1, compress_topk_idxs, compress_topk_idxs - offset)
 diff --git a/mindspeed_llm/pretrain_deepseek4.py b/mindspeed_llm/pretrain_deepseek4.py
 new file mode 100644
 --- /dev/null

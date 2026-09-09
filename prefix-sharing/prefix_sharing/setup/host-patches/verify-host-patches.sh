@@ -53,10 +53,12 @@ STRICT_MS=(
   "mindspeed_llm/tasks/models/transformer/dsa_indexer.py|cu_seqlens_cmp_kv_i|M9/M11 per-chunk cu"
   "mindspeed_llm/tasks/models/transformer/dsa_indexer.py|cu_seqlens_q_i|M9/M11 per-chunk cu(q)"
   "mindspeed_llm/ops/npu_sparse_flash_mla.py|get_cmp_cu_seqlens(cu_seqlens_kv|fix4(cmp cu 从 KV 侧推导)"
+  "mindspeed_llm/ops/npu_sparse_flash_mla.py|pad_mask|BSND-pad-fix(forward/backward pad 行 zero-fill)"
   "mindspeed_llm/tasks/models/transformer/deepseek4/compressor.py|freqs_cis.shape[0] != kv.shape[0]|M2(SP freqs 守卫)"
   "mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention_kernel.py|import triton.language as tl|M5(缺 import)"
   "mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention.py|k_is_global=packed_seq_params is not None|M3(all_gather k_is_global 传参)"
   "mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention.py|packed_seq_params is None and (self.config.sequence_parallel or self.kv_allgather)|M4(kv_compress gather 分支条件)"
+  "mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention.py|pad_mask = attention_mask|BSND-pad-fix(pad 行标记提取)"
 )
 STRICT_VERL=(
   "verl/utils/torch_functional.py|offsets.clone()|fix5a(offsets 断共享)"
