@@ -233,12 +233,16 @@ def _g2_kv_store_or_expand(
     # [PS-fix13-rc] recompute 分叉检测:按 (forward_id, micro_batch_id) 键控计数。
     # megatron full-recompute 下同一层同一 micro-batch 的 forward 跑两次,
     # 第二次调用 = 重算 pass。GAS>1 时纯奇偶计数会漂移,故按键区分。
+    # 计数载体 = attention_module;无层载体形态(None,单测 mock/纯 ctx 调用)
+    # → 无 module 状态可挂,rc=False(与上方 layer_number 的 None 容错同风格)。
     _ps_rc_key = (plan.forward_id, plan.micro_batch_id)
-    _ps_rc_counts = getattr(attention_module, "_ps_rc_counts", {})
-    _ps_rc_n = _ps_rc_counts.get(_ps_rc_key, 0) + 1
-    _ps_rc_counts[_ps_rc_key] = _ps_rc_n
-    setattr(attention_module, "_ps_rc_counts", _ps_rc_counts)
-    _ps_is_recompute = _ps_rc_n > 1
+    _ps_is_recompute = False
+    if attention_module is not None:
+        _ps_rc_counts = getattr(attention_module, "_ps_rc_counts", {})
+        _ps_rc_n = _ps_rc_counts.get(_ps_rc_key, 0) + 1
+        _ps_rc_counts[_ps_rc_key] = _ps_rc_n
+        setattr(attention_module, "_ps_rc_counts", _ps_rc_counts)
+        _ps_is_recompute = _ps_rc_n > 1
     # Empty batch (all sequences trimmed away) → return empty tensors unchanged.
     if layout.batch_size == 0:
         return (kv, kv_compress, indexer_k,
