@@ -10,17 +10,22 @@
 
 entries:
   - key: "mf-deepseek-v4-flash-v25"
+    # ps_commit = 2026-09-09 local golden sync: host-patches 四件替换为本地 patch-bundle
+    #   09-07 终态(Z1-re/_cp_m-clamp/topk-clamp 下界/BSND pad zero-fill + verl-env
+    #   device.py 还原 + verify-host-patches 锚点更新; 经 SC-1 run14 / SC-4 生产验证)。
+    #   仅本地调和(G6 clean-bake 验证用), 未推远端 — push = automodelwire 侧后续动作。
+    # 注: 历史基线 c2aaf74(08-31) 已由本 commit 取代(内容=本地 golden)。
     # ps_commit = 2026-09-02 pin 决策：c2aaf74(remote HEAD) —— 含 host-patches 三件装
     #   + 3 功能性修复(ccd98dd BSND-warning / ddd1e28 CP2-fix17b / 504a776 g2_attention)
     #   + M3/M4 修复。peer 真 PS-on 验证(2c + f1long20b 20 步全绿)停在 f513612(无 host-patches),
     #   c2aaf74 的运行时验证由 Skill 4.5 验收门禁承担(SC-2/SC-4 未跑即禁放行)。
-    ps_commit: "c2aaf74b059b45b2565af2ed0f34fbbd0f9e9d2d"
+    ps_commit: "36116fc50f41f38ddfa87f0300dd92897508ea07"
     verl: "0.8.0.dev"
     megatron_core: "0.12.1"
     mindspeed: null               # dsv4 容器 mindspeed 无版本标记
     cann: "9.1.0-beta.3"
     patch_set_id: "verl080_mcore0121_dsv4"
-    verified: "2026-09-02"
+    verified: "2026-09-09"
     notes: "18/18/30/30 precision tests used to be run on EARLIER code (07-22~08-03), NOT c2aaf74; c2aaf74 runtime validation = Skill 4.5 gate (SC-2/SC-4 pending)"
     test_results:
       unit_tests: "225/225 passing (Mac) [tested on pre-c2aaf74 code]"
