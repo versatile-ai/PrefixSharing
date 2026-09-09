@@ -10,6 +10,8 @@
 
 entries:
   - key: "mf-deepseek-v4-flash-v25"
+    # ps_commit = 2026-09-09 unit mock 对齐: g2_attention 测试补 MockContext.stats
+    #   + 单进程 get_rank 替身(08-28+ 运行时漂移;ps_verify 78/78)。
     # ps_commit = 2026-09-09 fix13-rc: g2_attention 重算计数 None 守卫
     #   (ps_verify 78/78: test_provider_store_kv attention_module=None mock 形态修复)。
     # ps_commit = 2026-09-09 local golden sync: host-patches 四件替换为本地 patch-bundle
@@ -21,7 +23,7 @@ entries:
     #   + 3 功能性修复(ccd98dd BSND-warning / ddd1e28 CP2-fix17b / 504a776 g2_attention)
     #   + M3/M4 修复。peer 真 PS-on 验证(2c + f1long20b 20 步全绿)停在 f513612(无 host-patches),
     #   c2aaf74 的运行时验证由 Skill 4.5 验收门禁承担(SC-2/SC-4 未跑即禁放行)。
-    ps_commit: "2fc88736a7c00de08202f8461f9625800140d09e"
+    ps_commit: "b24bd8a5dfdff6cd80ac755b93fa31aee8261b9b"
     verl: "0.8.0.dev"
     megatron_core: "0.12.1"
     mindspeed: null               # dsv4 容器 mindspeed 无版本标记
