@@ -10,6 +10,14 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+
+@pytest.fixture(autouse=True)
+def _single_rank(monkeypatch):
+    """integration 代码在 reuser-load 探针(VAL-DBG)里无条件调
+    torch.distributed.get_rank();单测 = 单进程语义(mock 无 PG)→ 替身 rank 0。"""
+    import torch.distributed as _dist
+    monkeypatch.setattr(_dist, "get_rank", lambda group=None: 0)
+
 from prefix_sharing.backends.packed_layout import PackedBatchLayout
 from prefix_sharing.core.prefix_store import (
     PREFIX_STATE_TYPE_G2_ATTENTION,
@@ -58,6 +66,7 @@ class MockContext:
     packed_batch_layout: PackedBatchLayout
     prefix_sharing_plan: object
     parallel_info: object = None
+    stats: object = None
 
     def __post_init__(self):
         if self.parallel_info is None:
